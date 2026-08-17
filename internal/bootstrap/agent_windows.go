@@ -5,6 +5,7 @@ package bootstrap
 import (
 	"net"
 	"os"
+	"time"
 
 	"github.com/Microsoft/go-winio"
 )
@@ -13,18 +14,40 @@ import (
 // (the ssh-agent service that ships with Windows 10+).
 const openSSHAgentPipe = `\\.\pipe\openssh-ssh-agent`
 
-// dialAgent connects to an ssh-agent: SSH_AUTH_SOCK first when set (Cygwin /
-// MSYS2 / third-party agents expose Unix-socket emulation Go can dial since
-// Windows supports AF_UNIX), then the native OpenSSH agent named pipe.
-func dialAgent() net.Conn {
+// pipeDialTimeout bounds each named-pipe connection attempt; an absent pipe
+// fails immediately, this only guards a present-but-wedged one.
+var pipeDialTimeout = 500 * time.Millisecond
+
+// dialAgents connects to every reachable ssh-agent, most explicit first:
+// SSH_AUTH_SOCK when set (Cygwin / MSYS2 emulation — Windows supports
+// AF_UNIX), then the dotvault agent named pipe (per the dotvault setting),
+// then the native OpenSSH agent pipe.
+func dialAgents(dotvault string) []net.Conn {
+	var conns []net.Conn
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 		if conn, err := net.Dial("unix", sock); err == nil {
-			return conn
+			conns = append(conns, conn)
 		}
 	}
-	conn, err := winio.DialPipe(openSSHAgentPipe, nil)
-	if err != nil {
-		return nil
+	if pipe := resolveDotvaultEndpoint(dotvault); pipe != "" {
+		if conn, err := winio.DialPipe(pipe, &pipeDialTimeout); err == nil {
+			conns = append(conns, conn)
+		}
 	}
-	return conn
+	if conn, err := winio.DialPipe(openSSHAgentPipe, &pipeDialTimeout); err == nil {
+		conns = append(conns, conn)
+	}
+	return conns
+}
+
+func resolveDotvaultEndpoint(dotvault string) string {
+	switch dotvault {
+	case DotvaultOff:
+		return ""
+	case DotvaultAuto, "":
+		return dotvaultAgentPipe
+	default:
+		// An explicit value is used verbatim — a \\.\pipe\... name.
+		return dotvault
+	}
 }

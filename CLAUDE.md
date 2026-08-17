@@ -40,7 +40,9 @@ internal/
                      receiver dedup/ordering, shutdown handshake
   statesync/         UserStream (keystrokes/resizes) diff/apply/subtract
   bootstrap/         SSH bootstrap: run mosh-server, parse MOSH CONNECT,
-                     host-key policies (strict/accept-new/insecure)
+                     host-key policies (strict/accept-new/insecure), agent
+                     aggregation (SSH_AUTH_SOCK + dotvault socket/pipe +
+                     Windows OpenSSH pipe)
   client/            Session loop: input pump, escape handling (Ctrl-^ .),
                      datagram pump, resize watcher (SIGWINCH / Windows poll)
   termenv/           Raw mode + Windows VT-processing enablement
@@ -68,6 +70,7 @@ These mirror the reference mosh implementation (`mobile-shell/mosh`); the integr
 - **Hand-rolled proto2 codec** (`internal/wire`) instead of protoc + generated code: the three messages are tiny and frozen since 2012; fixture tests pin the exact bytes.
 - **`x/crypto/ssh`, not the system ssh binary**, so Windows needs nothing installed. TERM/LANG ride as quoted env-assignment prefixes on the remote command line (sshd exec goes through the login shell), because `AcceptEnv` can't be assumed.
 - **Escape sequence** is fixed at Ctrl-^ (`.` quits, doubled sends literal). Disabled automatically for non-TTY stdin so scripted/piped sessions pass bytes through untouched.
+- **dotvault agent by convention, not by dependency.** gosh offers identities from a running [dotvault](https://github.com/goodtune/dotvault) daemon's SSH agent (Unix socket / Windows named pipe, `--dotvault-agent` to override or disable). The endpoint-resolution rule is mirrored in `internal/bootstrap/dotvault.go` rather than importing the dotvault module: dotvault's public `client/` facade deliberately does not export the agent endpoints, the agent speaks the standard SSH agent protocol gosh already consumes, and the dependency would drag in the Vault SDK for two path strings. Keep that file in sync with dotvault's `paths.DefaultAgentSocket` / `config.DefaultAgentPipe` if they ever move.
 - **testcontainers integration tests** build a Debian sshd+mosh-server image and are gated behind the `integration` build tag; unit tests must stay Docker-free.
 
 ## Testing

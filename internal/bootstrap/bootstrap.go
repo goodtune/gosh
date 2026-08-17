@@ -66,15 +66,52 @@ type Result struct {
 
 var connectRE = regexp.MustCompile(`(?m)^MOSH CONNECT (\d{1,5}) ([A-Za-z0-9/+]{22})\s*$`)
 
-// AgentAuth returns an ssh.AuthMethod backed by the running ssh-agent, or nil
-// if none is reachable. On Unix that means SSH_AUTH_SOCK; on Windows the
-// native OpenSSH agent's named pipe is tried as well (agent_windows.go).
-func AgentAuth() ssh.AuthMethod {
-	conn := dialAgent()
-	if conn == nil {
+// Sentinel values for the dotvault-agent setting accepted by AgentAuth.
+const (
+	// DotvaultAuto resolves dotvault's default agent endpoint for the
+	// platform ($XDG_RUNTIME_DIR/dotvault/agent.sock or the cache-dir
+	// fallback on Unix; the \\.\pipe\dotvault-agent named pipe on Windows).
+	DotvaultAuto = "auto"
+	// DotvaultOff skips the dotvault agent entirely.
+	DotvaultOff = "off"
+)
+
+// AgentAuth returns an ssh.AuthMethod aggregating the identities of every
+// reachable ssh-agent, or nil if none is. The chain is SSH_AUTH_SOCK, then
+// the dotvault agent when available (socket on Unix, named pipe on Windows;
+// dotvault selects the endpoint — DotvaultAuto, DotvaultOff, or an explicit
+// path), then Windows' native OpenSSH agent pipe. Signers are offered in
+// that order; the SSH handshake stops at the first key the server accepts.
+func AgentAuth(dotvault string) ssh.AuthMethod {
+	callback := agentSigners(dotvault)
+	if callback == nil {
 		return nil
 	}
-	return ssh.PublicKeysCallback(agent.NewClient(conn).Signers)
+	return ssh.PublicKeysCallback(callback)
+}
+
+// agentSigners is AgentAuth's engine, separated so tests can inspect the
+// aggregated signer list without driving a full SSH handshake.
+func agentSigners(dotvault string) func() ([]ssh.Signer, error) {
+	conns := dialAgents(dotvault)
+	if len(conns) == 0 {
+		return nil
+	}
+	clients := make([]agent.ExtendedAgent, len(conns))
+	for i, conn := range conns {
+		clients[i] = agent.NewClient(conn)
+	}
+	return func() ([]ssh.Signer, error) {
+		var signers []ssh.Signer
+		for _, cl := range clients {
+			s, err := cl.Signers()
+			if err != nil {
+				continue // one dead agent must not blank the others
+			}
+			signers = append(signers, s...)
+		}
+		return signers, nil
+	}
 }
 
 // Run connects over SSH, launches mosh-server, and returns the session

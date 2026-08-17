@@ -29,6 +29,7 @@ type rootOptions struct {
 	identity   string
 	knownHosts string
 	hostKey    string
+	dotvault   string
 }
 
 func newRootCmd() *cobra.Command {
@@ -53,6 +54,8 @@ func newRootCmd() *cobra.Command {
 	root.Flags().StringVar(&opts.knownHosts, "known-hosts", "", "known_hosts file (default ~/.ssh/known_hosts)")
 	root.Flags().StringVar(&opts.hostKey, "host-key-policy", string(bootstrap.PolicyAcceptNew),
 		"host key policy: strict, accept-new, or insecure")
+	root.Flags().StringVar(&opts.dotvault, "dotvault-agent", bootstrap.DotvaultAuto,
+		"dotvault SSH agent endpoint: auto (default location), off, or an explicit socket/pipe path")
 
 	root.AddCommand(newVersionCmd(), newConnectCmd())
 	root.CompletionOptions.DisableDefaultCmd = true
@@ -106,7 +109,7 @@ func authMethods(opts *rootOptions, user, host string) ([]ssh.AuthMethod, error)
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
-	if agent := bootstrap.AgentAuth(); agent != nil {
+	if agent := bootstrap.AgentAuth(opts.dotvault); agent != nil {
 		methods = append(methods, agent)
 	}
 	if termenv.IsTerminal(os.Stdin) {

@@ -1,0 +1,176 @@
+// Package network implements the client side of mosh's datagram layer: sealed
+// UDP packets with sequence numbers, direction bits, timestamp echoes for RTT
+// estimation, and replay protection.
+package network
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"net"
+	"time"
+
+	"github.com/goodtune/gosh/internal/crypto"
+)
+
+const (
+	// DefaultSendMTU mirrors mosh's DEFAULT_SEND_MTU.
+	DefaultSendMTU = 500
+	// AddedBytes is the datagram overhead added by this layer: the 8-byte
+	// nonce tail plus the two 16-bit timestamps.
+	AddedBytes = 8 + 4
+
+	receiveMTU = 2048
+
+	minRTO = 50 * time.Millisecond
+	maxRTO = 1000 * time.Millisecond
+)
+
+// ErrOldSequence marks a datagram dropped by replay protection; callers treat
+// it as silence, not failure.
+var ErrOldSequence = errors.New("network: stale sequence number")
+
+// Connection is the client end of a mosh session: one UDP socket aimed at the
+// server. Not safe for concurrent use; the client loop owns it.
+type Connection struct {
+	sock    *net.UDPConn
+	session *crypto.Session
+
+	nextSeq             uint64
+	expectedReceiverSeq uint64
+
+	savedTimestamp           uint16
+	savedTimestampReceivedAt time.Time
+	haveSavedTimestamp       bool
+
+	rttHit bool
+	srtt   float64 // ms
+	rttvar float64 // ms
+
+	lastHeard time.Time
+}
+
+// Dial creates the connection. addr is the server's UDP address ("host:port").
+func Dial(addr string, key crypto.Base64Key) (*Connection, error) {
+	session, err := crypto.NewSession(key)
+	if err != nil {
+		return nil, err
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", addr, err)
+	}
+	sock, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return nil, err
+	}
+	return &Connection{
+		sock:    sock,
+		session: session,
+		srtt:    1000,
+		rttvar:  500,
+	}, nil
+}
+
+// Close releases the socket.
+func (c *Connection) Close() error { return c.sock.Close() }
+
+// Send seals and transmits one transport payload.
+func (c *Connection) Send(payload []byte) error {
+	now := time.Now()
+	reply := tsMissing
+	if c.haveSavedTimestamp && now.Sub(c.savedTimestampReceivedAt) < time.Second {
+		// Echo the received timestamp advanced by our hold time.
+		reply = c.savedTimestamp + uint16(now.Sub(c.savedTimestampReceivedAt).Milliseconds())
+		c.haveSavedTimestamp = false
+	}
+	p := Packet{
+		Seq:            c.nextSeq,
+		Direction:      ToServer,
+		Timestamp:      timestamp16(now),
+		TimestampReply: reply,
+		Payload:        payload,
+	}
+	c.nextSeq++
+	wire, err := c.session.Encrypt(p.toMessage())
+	if err != nil {
+		return err
+	}
+	_, err = c.sock.Write(wire)
+	return err
+}
+
+// Recv waits up to timeout for one datagram and returns its transport
+// payload. Returns net timeout errors unchanged (callers poll), ErrOldSequence
+// for replayed/reordered-stale packets, and crypto errors for forgeries —
+// all of which the caller should treat as "nothing arrived".
+func (c *Connection) Recv(timeout time.Duration) ([]byte, error) {
+	if err := c.sock.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, receiveMTU)
+	n, err := c.sock.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	msg, err := c.session.Decrypt(buf[:n])
+	if err != nil {
+		return nil, err
+	}
+	p, err := packetFromMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	if p.Direction != ToClient {
+		return nil, errors.New("network: server sent client-direction packet")
+	}
+	if p.Seq < c.expectedReceiverSeq {
+		// Replay or heavy reordering: drop, exactly like mosh.
+		return nil, ErrOldSequence
+	}
+	c.expectedReceiverSeq = p.Seq + 1
+
+	now := time.Now()
+	c.lastHeard = now
+	c.savedTimestamp = p.Timestamp
+	c.savedTimestampReceivedAt = now
+	c.haveSavedTimestamp = true
+
+	if p.TimestampReply != tsMissing {
+		r := float64(timestampDiff(timestamp16(now), p.TimestampReply))
+		if !c.rttHit { // first measurement
+			c.srtt = r
+			c.rttvar = r / 2
+			c.rttHit = true
+		} else {
+			const alpha, beta = 1.0 / 8.0, 1.0 / 4.0
+			c.rttvar = (1-beta)*c.rttvar + beta*math.Abs(c.srtt-r)
+			c.srtt = (1-alpha)*c.srtt + alpha*r
+		}
+	}
+	return p.Payload, nil
+}
+
+// SRTT returns the smoothed round-trip estimate in milliseconds.
+func (c *Connection) SRTT() float64 { return c.srtt }
+
+// Timeout returns the retransmission timeout (RFC 6298 shape, mosh clamps).
+func (c *Connection) Timeout() time.Duration {
+	rto := time.Duration(math.Ceil(c.srtt+4*c.rttvar)) * time.Millisecond
+	if rto < minRTO {
+		return minRTO
+	}
+	if rto > maxRTO {
+		return maxRTO
+	}
+	return rto
+}
+
+// LastHeard reports when a valid server datagram last arrived (zero until the
+// first one).
+func (c *Connection) LastHeard() time.Time { return c.lastHeard }
+
+// MTU returns the payload budget for the transport layer.
+func (c *Connection) MTU() int {
+	return DefaultSendMTU - AddedBytes - crypto.AddedBytes
+}

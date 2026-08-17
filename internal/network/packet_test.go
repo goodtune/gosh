@@ -132,3 +132,48 @@ func TestSendRedialsAfterSocketError(t *testing.T) {
 		t.Fatal("server never received the redialed send")
 	}
 }
+
+// TestRecvClosedDistinguishesRedialFromIntentionalClose pins the contract
+// the client package's receive-pump goroutine relies on: when redial closes
+// the socket a blocked Recv was reading, that Recv's error must not look
+// like session shutdown (Closed() stays false, so the pump keeps looping),
+// but a real Close must (Closed() flips true, so the pump exits).
+func TestRecvClosedDistinguishesRedialFromIntentionalClose(t *testing.T) {
+	key, _ := crypto.ParseBase64Key("zr0jtuYVKJnfJHP/XOOsbQ")
+	server, err := newLoopbackServer(t, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Dial(server.addr, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate redial closing the socket a Recv call was about to read from,
+	// without going through Close.
+	if err := conn.sock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Recv(time.Second); err == nil {
+		t.Fatal("Recv on a closed socket returned no error")
+	}
+	if conn.Closed() {
+		t.Fatal("a redial-style socket close must not mark the connection as closed")
+	}
+
+	// Give the connection a live socket again, exactly as a real redial
+	// would, before exercising a genuine Close.
+	if err := conn.redial(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.Closed() {
+		t.Fatal("Close must mark the connection as closed")
+	}
+	if _, err := conn.Recv(time.Second); err == nil {
+		t.Fatal("Recv after Close returned no error")
+	}
+}

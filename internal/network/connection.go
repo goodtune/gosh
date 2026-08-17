@@ -127,7 +127,10 @@ func (c *Connection) redial() error {
 	return nil
 }
 
-// Send seals and transmits one transport payload.
+// Send seals and transmits one transport payload. Send and Close must only
+// ever be called from the same single goroutine (the transport sender's, per
+// package client) — redial's socket swap is unsynchronized against itself,
+// only against the separate Recv goroutine's reads via sockMu.
 func (c *Connection) Send(payload []byte) error {
 	now := time.Now()
 	c.mu.Lock()
@@ -160,7 +163,7 @@ func (c *Connection) Send(payload []byte) error {
 	// Likely a stale cached route after a network blip (Windows: WSAEINVAL).
 	// Redial and retry once before giving up.
 	if rerr := c.redial(); rerr != nil {
-		return err
+		return errors.Join(err, rerr)
 	}
 	_, err = c.currentSock().Write(wire)
 	return err

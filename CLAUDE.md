@@ -34,7 +34,8 @@ internal/
   crypto/            Datagram sealing: base64 session key, nonce scheme
                      (4 zero bytes + BE uint64, top bit = direction)
   network/           Client UDP connection: packets with 16-bit timestamp
-                     echoes, SRTT/RTTVAR + RTO, replay protection
+                     echoes, SRTT/RTTVAR + RTO, replay protection, socket
+                     redial on a send failure (Windows-blip recovery)
   transport/         State Synchronization Protocol: sender state machine
                      (a port of mosh's TransportSender), fragmenter + zlib,
                      receiver dedup/ordering, shutdown handshake
@@ -62,6 +63,7 @@ These mirror the reference mosh implementation (`mobile-shell/mosh`); the integr
 - **Receiver rule**: gosh is deliberately *stricter* than mosh here — render and acknowledge only an instruction whose `old_num` equals the state currently displayed (`transport.Transport.latestNum`), dedupe by `new_num`, never regress the ack. mosh accepts any still-held reference state because it applies diffs to stored state copies behind a framebuffer; without one, two diffs sharing a reference would paint the shared content twice (the "wwhhoo" doubled-echo bug). Acking only rendered states makes the server re-diff from what is actually on screen. This subsumes mosh's held-state idempotency rule and is a consequence of the no-terminal-emulator design below.
 - **Shutdown** is a state numbered `-1` (max uint64), retransmitted until acked (16 tries), whichever side starts it.
 - **MTU** is 500 minus 12 (nonce tail + timestamps) minus 16 (OCB tag); the fragmenter subtracts its own 10-byte header.
+- **Roaming** relies on `mosh-server` re-learning the client's source `(addr, port)` from the last validly-authenticated packet it receives, per the reference protocol — this is what makes it safe for `internal/network.Connection`'s socket redial (a fresh local ephemeral port after a send failure) to keep a session alive rather than requiring a stable client-side port.
 
 ## Design decisions
 

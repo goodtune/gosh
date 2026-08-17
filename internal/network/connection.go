@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/goodtune/gosh/internal/crypto"
@@ -31,10 +32,14 @@ const (
 var ErrOldSequence = errors.New("network: stale sequence number")
 
 // Connection is the client end of a mosh session: one UDP socket aimed at the
-// server. Not safe for concurrent use; the client loop owns it.
+// server. Safe for the client's split of one sending goroutine (which also
+// reads SRTT/Timeout via the transport sender) and one receiving goroutine:
+// the shared link state is guarded by mu.
 type Connection struct {
 	sock    *net.UDPConn
 	session *crypto.Session
+
+	mu sync.Mutex // guards all mutable state below
 
 	nextSeq             uint64
 	expectedReceiverSeq uint64
@@ -78,6 +83,7 @@ func (c *Connection) Close() error { return c.sock.Close() }
 // Send seals and transmits one transport payload.
 func (c *Connection) Send(payload []byte) error {
 	now := time.Now()
+	c.mu.Lock()
 	reply := tsMissing
 	if c.haveSavedTimestamp && now.Sub(c.savedTimestampReceivedAt) < time.Second {
 		// Echo the received timestamp advanced by our hold time.
@@ -95,6 +101,7 @@ func (c *Connection) Send(payload []byte) error {
 		Payload:        payload,
 	}
 	c.nextSeq++
+	c.mu.Unlock()
 	wire, err := c.session.Encrypt(p.toMessage())
 	if err != nil {
 		return err
@@ -127,6 +134,8 @@ func (c *Connection) Recv(timeout time.Duration) ([]byte, error) {
 	if p.Direction != ToClient {
 		return nil, errors.New("network: server sent client-direction packet")
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if p.Seq < c.expectedReceiverSeq {
 		// Replay or heavy reordering: drop, exactly like mosh.
 		return nil, ErrOldSequence
@@ -155,11 +164,17 @@ func (c *Connection) Recv(timeout time.Duration) ([]byte, error) {
 }
 
 // SRTT returns the smoothed round-trip estimate in milliseconds.
-func (c *Connection) SRTT() float64 { return c.srtt }
+func (c *Connection) SRTT() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.srtt
+}
 
 // Timeout returns the retransmission timeout (RFC 6298 shape, mosh clamps).
 func (c *Connection) Timeout() time.Duration {
+	c.mu.Lock()
 	rto := time.Duration(math.Ceil(c.srtt+4*c.rttvar)) * time.Millisecond
+	c.mu.Unlock()
 	if rto < minRTO {
 		return minRTO
 	}
@@ -171,7 +186,11 @@ func (c *Connection) Timeout() time.Duration {
 
 // LastHeard reports when a valid server datagram last arrived (zero until the
 // first one).
-func (c *Connection) LastHeard() time.Time { return c.lastHeard }
+func (c *Connection) LastHeard() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastHeard
+}
 
 // MTU returns the payload budget for the transport layer.
 func (c *Connection) MTU() int {

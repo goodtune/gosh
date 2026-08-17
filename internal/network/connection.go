@@ -26,6 +26,25 @@ const (
 
 	minRTO = 50 * time.Millisecond
 	maxRTO = 1000 * time.Millisecond
+
+	// dialTimeout bounds (re)dialing the UDP socket. On Windows, a network
+	// adapter mid-transition (disabling, sleep/resume) can leave connect()
+	// blocked for a long time rather than failing fast — and Send runs
+	// synchronously on the same goroutine that reads local keystrokes and
+	// the quit escape sequence, so an unbounded dial there hangs the whole
+	// client, not just the network layer. One Send's own worst case (dial +
+	// write, once retried) lands under the shutdown handshake's own budget
+	// (client.Config.ShutdownTimeout, default 3s); transport.maxSendBurst
+	// keeps a many-fragment diff from multiplying that per fragment. These
+	// specific values are chosen, not measured — this project has no
+	// Windows CI, so dialUDP's own goroutine+select wrapper (not net.Dialer
+	// alone, which may not preempt a wedged UDP connect() on Windows) is
+	// what actually guarantees this bound regardless of platform behavior.
+	dialTimeout = 1500 * time.Millisecond
+	// writeTimeout bounds a single socket write for the same reason: on a
+	// wedged adapter, WSASend can block instead of returning WSAEINVAL
+	// immediately.
+	writeTimeout = 500 * time.Millisecond
 )
 
 // ErrOldSequence marks a datagram dropped by replay protection; callers treat
@@ -79,7 +98,7 @@ func Dial(addr string, key crypto.Base64Key) (*Connection, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", addr, err)
 	}
-	sock, err := net.DialUDP("udp", nil, udpAddr)
+	sock, err := dialUDP(udpAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +134,7 @@ func (c *Connection) currentSock() *net.UDPConn {
 // address, closing the old one. Safe to call concurrently with Recv, which
 // always reads c.sock through currentSock.
 func (c *Connection) redial() error {
-	newSock, err := net.DialUDP("udp", nil, c.raddr)
+	newSock, err := dialUDP(c.raddr)
 	if err != nil {
 		return err
 	}
@@ -125,6 +144,55 @@ func (c *Connection) redial() error {
 	c.sockMu.Unlock()
 	old.Close()
 	return nil
+}
+
+// rawDialUDP is the actual dial primitive, indirected so tests can replace
+// it with something that hangs past dialTimeout without needing a real
+// wedged network adapter to reproduce that.
+var rawDialUDP = func(raddr *net.UDPAddr) (*net.UDPConn, error) {
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.Dial("udp", raddr.String())
+	if err != nil {
+		return nil, err
+	}
+	sock, ok := conn.(*net.UDPConn)
+	if !ok { // unreachable: network "udp" always yields a *net.UDPConn
+		conn.Close()
+		return nil, fmt.Errorf("network: dialer returned %T, not *net.UDPConn", conn)
+	}
+	return sock, nil
+}
+
+// dialUDP enforces dialTimeout itself rather than trusting rawDialUDP's own
+// net.Dialer.Timeout to do it: on Windows, UDP's connect() is a local
+// route/association call rather than a handshake, and may not run through
+// the overlapped-I/O path Go's dial deadline can actually cancel — unlike a
+// TCP dial or (per net.UDPConn.Write's use of WSASend) a socket write, both
+// of which are. If rawDialUDP itself blocks past the OS's own deadline
+// handling, this caller still gets control back on schedule; the abandoned
+// call is left to finish (or never does) in its own goroutine, closing
+// whatever socket it produces so it doesn't leak an open fd.
+func dialUDP(raddr *net.UDPAddr) (*net.UDPConn, error) {
+	type result struct {
+		sock *net.UDPConn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		sock, err := rawDialUDP(raddr)
+		ch <- result{sock, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.sock, r.err
+	case <-time.After(dialTimeout):
+		go func() {
+			if r := <-ch; r.err == nil {
+				r.sock.Close()
+			}
+		}()
+		return nil, fmt.Errorf("network: dial timed out after %s", dialTimeout)
+	}
 }
 
 // Send seals and transmits one transport payload. Send and Close must only
@@ -156,16 +224,27 @@ func (c *Connection) Send(payload []byte) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.currentSock().Write(wire)
+	err = c.write(wire)
 	if err == nil || c.closed.Load() {
 		return err
 	}
-	// Likely a stale cached route after a network blip (Windows: WSAEINVAL).
-	// Redial and retry once before giving up.
+	// Likely a stale cached route after a network blip (Windows: WSAEINVAL,
+	// or a wedged adapter that just times out). Redial and retry once
+	// before giving up.
 	if rerr := c.redial(); rerr != nil {
 		return errors.Join(err, rerr)
 	}
-	_, err = c.currentSock().Write(wire)
+	return c.write(wire)
+}
+
+// write bounds a single socket write with writeTimeout — see dialTimeout's
+// doc comment for why an unbounded call here is unacceptable.
+func (c *Connection) write(b []byte) error {
+	sock := c.currentSock()
+	if err := sock.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	_, err := sock.Write(b)
 	return err
 }
 

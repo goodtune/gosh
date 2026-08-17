@@ -401,3 +401,67 @@ func TestFragmentationRoundTrip(t *testing.T) {
 		t.Fatal("reassembled diff mismatch")
 	}
 }
+
+// slowConn is senderConn with an artificial per-Send delay, standing in for
+// a network.Connection.Send call that's slow but not outright erroring
+// (e.g. every fragment individually surviving its own dial/write timeout
+// budget, one after another).
+type slowConn struct {
+	mtu   int
+	delay time.Duration
+	sent  int
+}
+
+func (f *slowConn) Send(p []byte) error {
+	f.sent++
+	time.Sleep(f.delay)
+	return nil
+}
+func (f *slowConn) SRTT() float64          { return 100 }
+func (f *slowConn) Timeout() time.Duration { return 200 * time.Millisecond }
+func (f *slowConn) MTU() int               { return f.mtu }
+
+// TestSendInFragmentsRespectsBurstDeadline is the regression test for the
+// per-fragment multiplication bug: a diff that fragments into many pieces
+// must not multiply each fragment's own worst-case network latency by the
+// fragment count, since Tick runs synchronously on client.Session.Run's
+// single input-handling goroutine. Before maxSendBurst existed, this test
+// would take fragments*delay (tens of seconds); with it, sendInFragments
+// bails out once over budget and leaves the rest for the next scheduled
+// retransmission.
+func TestSendInFragmentsRespectsBurstDeadline(t *testing.T) {
+	const delay = 400 * time.Millisecond
+	conn := &slowConn{mtu: 60, delay: delay}
+	tr := New(conn, func([]byte) error { return nil })
+
+	// Incompressible pseudorandom bytes, large enough at this MTU to
+	// fragment into far more pieces than maxSendBurst/delay allows through.
+	big := make([]byte, 4000)
+	state := uint32(0x2545F491)
+	for i := range big {
+		state = state*1664525 + 1013904223
+		big[i] = byte(state >> 24)
+	}
+	tr.UserStream().PushKeys(big)
+
+	start := time.Now()
+	if err := tr.Sender.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > maxSendBurst+delay+time.Second {
+		t.Fatalf("Tick took %s, want roughly bounded by maxSendBurst (%s)", elapsed, maxSendBurst)
+	}
+	// A full transmission at this MTU needs far more than maxSendBurst/delay
+	// fragments (4000 incompressible bytes over a ~50-byte payload budget is
+	// on the order of 80); bound sent loosely on the deadline math alone so
+	// this doesn't depend on reconstructing the exact wire bytes (chaff
+	// varies fragment count by a byte or two run to run).
+	if maxAllowed := int(maxSendBurst/delay) + 2; conn.sent > maxAllowed {
+		t.Fatalf("sent %d fragments, want at most ~%d given a %s deadline and %s delay", conn.sent, maxAllowed, maxSendBurst, delay)
+	}
+	if conn.sent < 2 {
+		t.Fatalf("sent only %d fragment(s); test didn't exercise multi-fragment bailout", conn.sent)
+	}
+}

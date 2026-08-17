@@ -35,7 +35,10 @@ internal/
                      (4 zero bytes + BE uint64, top bit = direction)
   network/           Client UDP connection: packets with 16-bit timestamp
                      echoes, SRTT/RTTVAR + RTO, replay protection, socket
-                     redial on a send failure (Windows-blip recovery)
+                     redial on a send failure (Windows-blip recovery), with
+                     dial/write timeouts so a wedged adapter can only delay
+                     the client's single input-handling goroutine, never
+                     block it outright
   transport/         State Synchronization Protocol: sender state machine
                      (a port of mosh's TransportSender), fragmenter + zlib,
                      receiver dedup/ordering, shutdown handshake

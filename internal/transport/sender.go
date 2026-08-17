@@ -16,6 +16,17 @@ const (
 	ackDelay        = 100 * time.Millisecond
 	sendMindelay    = 8 * time.Millisecond
 	shutdownRetries = 16
+
+	// maxSendBurst bounds how long sendInFragments keeps attempting
+	// fragments for one instruction. Tick runs synchronously on
+	// client.Session.Run's single goroutine, the same one that reads local
+	// keystrokes and the quit escape sequence, so a diff that fragments
+	// into many pieces must not multiply each fragment's own worst-case
+	// network latency (network.Connection.Send's dial/write timeouts) by
+	// the fragment count. Fragments dropped by the deadline are retried
+	// whole on the next scheduled retransmission — exactly like fragments
+	// lost to the network already are, which the protocol already handles.
+	maxSendBurst = 3 * time.Second
 )
 
 // ProtocolVersion is MOSH_PROTOCOL_VERSION (2, "bumped for echo-ack").
@@ -290,7 +301,13 @@ func (s *sender) sendInFragments(diff []byte, newNum uint64) error {
 	if newNum == ShutdownNum {
 		s.shutdownTries++
 	}
+	deadline := time.Now().Add(maxSendBurst)
 	for _, f := range s.fragmenter.makeFragments(inst.Marshal(), s.conn.MTU()) {
+		if time.Now().After(deadline) {
+			// Over budget: leave the rest for the next retransmission
+			// rather than blocking this Tick call further.
+			break
+		}
 		if err := s.conn.Send(f.marshal()); err != nil {
 			return err
 		}

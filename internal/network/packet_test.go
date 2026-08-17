@@ -2,6 +2,7 @@ package network
 
 import (
 	"bytes"
+	"net"
 	"testing"
 	"time"
 
@@ -130,6 +131,92 @@ func TestSendRedialsAfterSocketError(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received the redialed send")
+	}
+}
+
+// hangRawDialUDP replaces the package-level rawDialUDP with a fake that
+// blocks until the test is done, then restores it. The restore in Cleanup
+// only happens after the fake itself has returned (synchronized through
+// fakeDone), so there is no unsynchronized access to the rawDialUDP
+// variable across goroutines for -race to catch: dialUDP's background
+// goroutine reads rawDialUDP exactly once, to obtain this fake, before ever
+// blocking — nothing reads the variable again afterwards.
+func hangRawDialUDP(t *testing.T) {
+	t.Helper()
+	unblock := make(chan struct{})
+	fakeDone := make(chan struct{})
+	real := rawDialUDP
+	rawDialUDP = func(raddr *net.UDPAddr) (*net.UDPConn, error) {
+		<-unblock
+		defer close(fakeDone)
+		return real(raddr)
+	}
+	t.Cleanup(func() {
+		close(unblock)
+		<-fakeDone
+		rawDialUDP = real
+	})
+}
+
+// TestDialUDPBoundsAHungRawDial guards the actual failure mode reported
+// against a real Windows adapter: connect() blocking instead of erroring
+// during a network transition. A non-routable destination address fails
+// fast on every platform this suite runs on, so it can't exercise that path
+// — instead this replaces rawDialUDP with a fake that blocks far longer
+// than dialTimeout, the closest a portable test gets to a genuinely wedged
+// syscall, and checks dialUDP still returns on schedule. Reverting dialUDP
+// to call rawDialUDP directly (dropping the goroutine+select wrapper) would
+// make this test hang until its own safety timeout and fail.
+func TestDialUDPBoundsAHungRawDial(t *testing.T) {
+	hangRawDialUDP(t)
+
+	budget := dialTimeout + 2*time.Second
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := dialUDP(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); err == nil {
+			t.Error("dialUDP against a hung raw dial returned no error")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(budget):
+		t.Fatalf("dialUDP did not return within %s of a hung raw dial", budget)
+	}
+}
+
+// TestSendRecoversWhenRedialItselfIsHung is the end-to-end version: with the
+// same hung rawDialUDP, Send's redial-and-retry path must still return
+// within its overall timeout budget rather than hanging the caller (in
+// production, client.Session.Run's single input-handling goroutine).
+func TestSendRecoversWhenRedialItselfIsHung(t *testing.T) {
+	key, _ := crypto.ParseBase64Key("zr0jtuYVKJnfJHP/XOOsbQ")
+	server, err := newLoopbackServer(t, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Dial(server.addr, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.sock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	hangRawDialUDP(t)
+
+	budget := dialTimeout + writeTimeout + 2*time.Second
+	done := make(chan error, 1)
+	go func() { done <- conn.Send([]byte("probe")) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Send succeeded despite a hung redial — unexpected but not a hang, investigate")
+		}
+	case <-time.After(budget):
+		t.Fatalf("Send did not return within %s of a hung redial", budget)
 	}
 }
 

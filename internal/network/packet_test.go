@@ -93,3 +93,42 @@ func TestLoopbackConnection(t *testing.T) {
 		t.Fatalf("replay: err = %v, want ErrOldSequence", err)
 	}
 }
+
+// TestSendRedialsAfterSocketError reproduces the Windows network-blip bug: a
+// connected UDP socket that starts failing every write (WSAEINVAL there,
+// simulated here by closing the socket out from under Send) must not sink
+// the session — Send should redial and keep going.
+func TestSendRedialsAfterSocketError(t *testing.T) {
+	key, _ := crypto.ParseBase64Key("zr0jtuYVKJnfJHP/XOOsbQ")
+	server, err := newLoopbackServer(t, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Dial(server.addr, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Simulate the stale-socket condition directly: close the live socket
+	// without marking the Connection as intentionally closed.
+	if err := conn.sock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.Send([]byte("still here")); err != nil {
+		t.Fatalf("Send did not recover from a broken socket: %v", err)
+	}
+	if conn.Closed() {
+		t.Fatal("redial must not mark the connection as closed")
+	}
+
+	select {
+	case got := <-server.received:
+		if string(got) != "still here" {
+			t.Fatalf("server got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the redialed send")
+	}
+}

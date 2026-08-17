@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"time"
 
 	"github.com/goodtune/gosh/internal/crypto"
@@ -127,7 +126,7 @@ func (s *Session) Run(ctx context.Context) error {
 		for {
 			payload, err := s.conn.Recv(250 * time.Millisecond)
 			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
+				if s.conn.Closed() {
 					return
 				}
 				// Everything else — read timeouts, replayed sequence numbers,

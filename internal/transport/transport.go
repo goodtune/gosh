@@ -15,12 +15,6 @@ import (
 // ErrVersionMismatch is fatal: the peer speaks a different protocol version.
 var ErrVersionMismatch = errors.New("transport: mosh protocol version mismatch")
 
-// receivedState tracks one server state we have acknowledged receipt of.
-type receivedState struct {
-	num        uint64
-	receivedAt time.Time
-}
-
 // Transport drives one client session: outgoing UserStream sync plus incoming
 // server-state instructions. Diffs of newly received states are handed to the
 // apply callback (terminal bytes, resizes, echo acks). Not safe for
@@ -28,9 +22,12 @@ type receivedState struct {
 type Transport struct {
 	Sender *sender
 
-	assembly       assembly
-	receivedStates []receivedState
-	latestNum      uint64
+	assembly assembly
+
+	// latestNum is the server state currently rendered on the terminal —
+	// the only reference state diffs can be applied against, and the only
+	// state this client ever acknowledges (see Recv).
+	latestNum uint64
 
 	// Apply receives the diff of each new server state, in order.
 	Apply func(diff []byte) error
@@ -43,9 +40,8 @@ type Transport struct {
 // needs; in production a *network.Connection).
 func New(conn senderConn, apply func(diff []byte) error) *Transport {
 	return &Transport{
-		Sender:         newSender(conn),
-		receivedStates: []receivedState{{num: 0, receivedAt: time.Now()}},
-		Apply:          apply,
+		Sender: newSender(conn),
+		Apply:  apply,
 	}
 }
 
@@ -69,70 +65,48 @@ func (t *Transport) Recv(payload []byte) error {
 	}
 
 	t.Sender.ProcessAcknowledgmentThrough(inst.AckNum)
+	t.Sender.RemoteHeard(time.Now())
 
 	if inst.NewNum == ShutdownNum {
+		// The server is shutting down (logout). Note the intent immediately
+		// so the client can begin its own handshake, but acceptance —
+		// rendering the final diff and acking the shutdown state — goes
+		// through the same reference-matching path as any other state:
+		// acking before rendering would let the server exit with the last
+		// output undisplayed, and rendering outside the reference rule would
+		// reintroduce the double-paint this receiver exists to prevent.
+		// ShutdownNum is the max uint64, so once accepted it latches
+		// latestNum and every retransmit dedupes below.
 		t.remoteShutdown = true
 	}
 
-	// Drop states we already have.
-	for _, rs := range t.receivedStates {
-		if rs.num == inst.NewNum {
-			return nil
-		}
+	// Acceptance is stricter than reference mosh, deliberately. mosh applies
+	// a diff to a stored *copy* of any reference state it still holds, then
+	// renders through its framebuffer — so overlapping diffs from the same
+	// reference are idempotent. gosh writes diff bytes straight to the
+	// terminal (see CLAUDE.md "No terminal emulator"), so a diff is only
+	// safe to render when its reference is exactly the state on screen:
+	// applying two diffs that share an old_num would paint the shared
+	// content twice. We therefore render and acknowledge only old_num ==
+	// latestNum, and the server converges by re-diffing from our last ack —
+	// this subsumes mosh's "old_num must be a held state" idempotency rule
+	// (the only held state is the displayed one).
+	if inst.NewNum <= t.latestNum { // duplicate or stale retransmit
+		return nil
 	}
-	// The reference (old) state must still be in our window; this is
-	// security-sensitive idempotency enforcement, exactly as in mosh.
-	found := false
-	for _, rs := range t.receivedStates {
-		if rs.num == inst.OldNum {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if inst.OldNum != t.latestNum { // reference is not what the screen shows
 		return nil
 	}
 
-	t.processThrowawayUntil(inst.ThrowawayNum)
-
-	now := time.Now()
-	t.receivedStates = append(t.receivedStates, receivedState{num: inst.NewNum, receivedAt: now})
-	if len(t.receivedStates) > 1024 { // mirror mosh's receiver queue bound
-		t.receivedStates = t.receivedStates[len(t.receivedStates)-1024:]
-	}
-
-	// Acknowledge the numerically largest state we hold (mosh acks the back
-	// of its sorted receive queue; an out-of-order arrival must not regress
-	// the ack).
-	if inst.NewNum == ShutdownNum || inst.NewNum > t.latestNum {
-		t.Sender.SetAckNum(inst.NewNum)
-	}
-	t.Sender.RemoteHeard(now)
 	if len(inst.Diff) > 0 {
 		t.Sender.SetDataAck()
-		// Render only forward progress: a retransmitted diff targeting a
-		// state older than what we've already applied would rewind the
-		// display (we keep no framebuffer to diff against, unlike mosh).
-		if inst.NewNum > t.latestNum || inst.NewNum == ShutdownNum {
-			if err := t.Apply(inst.Diff); err != nil {
-				return err
-			}
+		if err := t.Apply(inst.Diff); err != nil {
+			return err
 		}
 	}
-	if inst.NewNum > t.latestNum && inst.NewNum != ShutdownNum {
-		t.latestNum = inst.NewNum
-	}
+	t.latestNum = inst.NewNum
+	t.Sender.SetAckNum(inst.NewNum)
 	return nil
-}
-
-func (t *Transport) processThrowawayUntil(throwaway uint64) {
-	kept := t.receivedStates[:0]
-	for _, rs := range t.receivedStates {
-		if rs.num >= throwaway {
-			kept = append(kept, rs)
-		}
-	}
-	t.receivedStates = kept
 }
 
 // RemoteShutdown reports whether the server has begun shutdown.

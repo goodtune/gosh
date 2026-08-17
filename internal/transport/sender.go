@@ -82,8 +82,15 @@ func (s *sender) State() *statesync.UserStream { return s.currentState }
 // RemoteHeard records when the remote last spoke (delays empty acks).
 func (s *sender) RemoteHeard(t time.Time) { /* informational in this port */ }
 
-// SetAckNum records the newest remote state to acknowledge.
-func (s *sender) SetAckNum(n uint64) { s.ackNum = n }
+// SetAckNum records the newest remote state to acknowledge. Monotonic: an
+// ack must never regress (mosh acks the back of its sorted receive queue;
+// the transport's acceptance rule makes regressions impossible anyway, this
+// guard keeps the invariant local).
+func (s *sender) SetAckNum(n uint64) {
+	if n > s.ackNum {
+		s.ackNum = n
+	}
+}
 
 // SetDataAck notes that we owe the server a prompt ack for real data.
 func (s *sender) SetDataAck() { s.pendingDataAck = true }

@@ -149,41 +149,48 @@ func TestSenderStateQueueTrim(t *testing.T) {
 	}
 }
 
-func TestReceiverThrowawayPruning(t *testing.T) {
+// TestNoDoubleRenderOnSharedReference is the regression test for the doubled
+// terminal output seen in the field ("wwhhoo"): with two instructions in
+// flight the server diffs both from the same acked reference (0→1 carrying
+// "w", then 0→2 carrying "wh" before our ack of 1 lands). Rendering both
+// would paint "w" twice; the receiver must render the first, skip the second
+// (its reference is no longer the displayed state), and let the server
+// re-diff 1→2.
+func TestNoDoubleRenderOnSharedReference(t *testing.T) {
 	conn := &fakeConn{mtu: 472}
-	tr := New(conn, func([]byte) error { return nil })
+	var out []byte
+	tr := New(conn, func(d []byte) error { out = append(out, d...); return nil })
 
-	h := &serverHarness{}
-	for i := 0; i < 5; i++ {
-		for _, p := range h.instruction(uint64(i), []byte("frame")) {
-			if err := tr.Recv(p); err != nil {
+	var fr fragmenter
+	send := func(oldNum, newNum uint64, diff string) {
+		inst := &wire.Instruction{ProtocolVersion: 2, OldNum: oldNum, NewNum: newNum, Diff: []byte(diff)}
+		for _, f := range fr.makeFragments(inst.Marshal(), 472) {
+			if err := tr.Recv(f.marshal()); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	// Now the server says states below 4 can be discarded.
-	inst := &wire.Instruction{ProtocolVersion: 2, OldNum: 5, NewNum: 6, ThrowawayNum: 4, Diff: []byte("f6")}
-	var fr fragmenter
-	for _, f := range fr.makeFragments(inst.Marshal(), 472) {
-		if err := tr.Recv(f.marshal()); err != nil {
-			t.Fatal(err)
-		}
+
+	send(0, 1, "w")
+	send(0, 2, "wh") // same reference: must NOT render (would double the w)
+	if string(out) != "w" {
+		t.Fatalf("rendered %q after overlapping diffs, want %q", out, "w")
 	}
-	for _, rs := range tr.receivedStates {
-		if rs.num < 4 {
-			t.Fatalf("state %d survived throwaway_num 4", rs.num)
-		}
+	if tr.Sender.ackNum != 1 {
+		t.Fatalf("ackNum = %d, want 1 (unrendered state must not be acked)", tr.Sender.ackNum)
 	}
-	// A late instruction referencing a pruned state must now be ignored.
-	late := &wire.Instruction{ProtocolVersion: 2, OldNum: 2, NewNum: 7, Diff: []byte("stale")}
-	applied := len(tr.receivedStates)
-	for _, f := range fr.makeFragments(late.Marshal(), 472) {
-		if err := tr.Recv(f.marshal()); err != nil {
-			t.Fatal(err)
-		}
+	send(1, 2, "h") // the server's re-diff from our ack renders cleanly
+	if string(out) != "wh" {
+		t.Fatalf("rendered %q, want %q", out, "wh")
 	}
-	if len(tr.receivedStates) != applied {
-		t.Fatal("instruction from pruned reference state was accepted")
+	if tr.Sender.ackNum != 2 || tr.latestNum != 2 {
+		t.Fatalf("ack %d latest %d, want 2/2", tr.Sender.ackNum, tr.latestNum)
+	}
+	// Loss recovery still works without an intermediate state: a diff from
+	// the displayed state straight to a later one renders directly.
+	send(2, 5, "o")
+	if string(out) != "who" || tr.latestNum != 5 {
+		t.Fatalf("rendered %q latest %d, want %q/5", out, tr.latestNum, "who")
 	}
 }
 
@@ -304,6 +311,53 @@ func TestShutdownHandshake(t *testing.T) {
 	tr.Sender.ProcessAcknowledgmentThrough(ShutdownNum)
 	if !tr.Sender.ShutdownAcknowledged() {
 		t.Fatal("shutdown not acknowledged after ack")
+	}
+}
+
+// TestShutdownRetransmitRendersOnce covers server-initiated shutdown: the
+// final diff renders exactly once across retransmissions, the shutdown state
+// is acked only after acceptance, and a late regular instruction can neither
+// regress the ack nor paint over the final output.
+func TestShutdownRetransmitRendersOnce(t *testing.T) {
+	conn := &fakeConn{mtu: 472}
+	var out []byte
+	tr := New(conn, func(d []byte) error { out = append(out, d...); return nil })
+
+	var fr fragmenter
+	send := func(oldNum, newNum uint64, diff string) {
+		inst := &wire.Instruction{ProtocolVersion: 2, OldNum: oldNum, NewNum: newNum, Diff: []byte(diff)}
+		for _, f := range fr.makeFragments(inst.Marshal(), 472) {
+			if err := tr.Recv(f.marshal()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	send(0, 1, "session")
+	// Shutdown diffed from a state we don't display yet: intent noted, but
+	// neither rendered nor acked.
+	send(2, ShutdownNum, "logout\n")
+	if !tr.RemoteShutdown() {
+		t.Fatal("remote shutdown not observed")
+	}
+	if string(out) != "session" || tr.Sender.ackNum != 1 {
+		t.Fatalf("out %q ack %d after unrenderable shutdown, want session/1", out, tr.Sender.ackNum)
+	}
+	// The server re-diffs from our ack; accept, render once, ack shutdown.
+	send(1, ShutdownNum, "logout\n")
+	if string(out) != "sessionlogout\n" || tr.Sender.ackNum != ShutdownNum {
+		t.Fatalf("out %q ack %d, want rendered logout + shutdown ack", out, tr.Sender.ackNum)
+	}
+	// Retransmissions must dedupe, not repaint.
+	send(1, ShutdownNum, "logout\n")
+	send(1, ShutdownNum, "logout\n")
+	if string(out) != "sessionlogout\n" {
+		t.Fatalf("retransmitted shutdown repainted: %q", out)
+	}
+	// A late in-flight regular instruction neither renders nor regresses.
+	send(1, 2, "stale")
+	if string(out) != "sessionlogout\n" || tr.Sender.ackNum != ShutdownNum {
+		t.Fatalf("late instruction broke shutdown state: out %q ack %d", out, tr.Sender.ackNum)
 	}
 }
 

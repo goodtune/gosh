@@ -32,9 +32,14 @@ const (
 	// blocked for a long time rather than failing fast — and Send runs
 	// synchronously on the same goroutine that reads local keystrokes and
 	// the quit escape sequence, so an unbounded dial there hangs the whole
-	// client, not just the network layer. One Send's own worst case (dial +
-	// write, once retried) lands under the shutdown handshake's own budget
-	// (client.Config.ShutdownTimeout, default 3s); transport.maxSendBurst
+	// client, not just the network layer. One Send's own worst case is one
+	// dial plus one retried write — either maybeHopPort's proactive redial
+	// (dialTimeout) followed by a single write (writeTimeout), or a write
+	// (writeTimeout) followed by the error-path redial-and-retry
+	// (dialTimeout+writeTimeout); Send deliberately never does both dials
+	// in the same call (see the "hopped" check there), or this budget would
+	// double to ~4s and blow past the shutdown handshake's own budget
+	// (client.Config.ShutdownTimeout, default 3s). transport.maxSendBurst
 	// keeps a many-fragment diff from multiplying that per fragment. These
 	// specific values are chosen, not measured — this project has no
 	// Windows CI, so dialUDP's own goroutine+select wrapper (not net.Dialer
@@ -45,6 +50,15 @@ const (
 	// wedged adapter, WSASend can block instead of returning WSAEINVAL
 	// immediately.
 	writeTimeout = 500 * time.Millisecond
+
+	// portHopInterval mirrors mosh's PORT_HOP_INTERVAL (network.h): the
+	// redial-on-error path only helps when the OS actually reports a
+	// failure. A route that silently blackholes — writes keep "succeeding"
+	// into the void, which is what a Windows adapter does after some
+	// network transitions — never errors, so it never redials. mosh's fix
+	// is proactive: redial unconditionally once it's been this long since
+	// both the last port change and the last confirmed round trip.
+	portHopInterval = 10 * time.Second
 )
 
 // ErrOldSequence marks a datagram dropped by replay protection; callers treat
@@ -86,6 +100,14 @@ type Connection struct {
 	rttvar float64 // ms
 
 	lastHeard time.Time
+
+	// lastPortChoice is when the socket was last (re)dialed. lastRoundtrip
+	// success is when a sent state was last confirmed acknowledged end to
+	// end (set by the transport layer, which is the only layer that knows
+	// — see SetLastRoundtripSuccess); zero means "never". Together they
+	// drive the portHopInterval proactive redial in Send.
+	lastPortChoice       time.Time
+	lastRoundtripSuccess time.Time
 }
 
 // Dial creates the connection. addr is the server's UDP address ("host:port").
@@ -103,11 +125,12 @@ func Dial(addr string, key crypto.Base64Key) (*Connection, error) {
 		return nil, err
 	}
 	return &Connection{
-		raddr:   udpAddr,
-		sock:    sock,
-		session: session,
-		srtt:    1000,
-		rttvar:  500,
+		raddr:          udpAddr,
+		sock:           sock,
+		session:        session,
+		srtt:           1000,
+		rttvar:         500,
+		lastPortChoice: time.Now(),
 	}, nil
 }
 
@@ -143,7 +166,51 @@ func (c *Connection) redial() error {
 	c.sock = newSock
 	c.sockMu.Unlock()
 	old.Close()
+	c.mu.Lock()
+	c.lastPortChoice = time.Now()
+	c.mu.Unlock()
 	return nil
+}
+
+// SetLastRoundtripSuccess records that a sent state was just confirmed
+// acknowledged end to end. Called by the transport layer (the only layer
+// that knows an ack arrived) once per accepted instruction, via
+// sender.NoteRoundtripSuccess — mirrors mosh's
+// Connection::set_last_roundtrip_success, fed
+// sender.get_sent_state_acked_timestamp(). t is monotonic in practice (it
+// comes from an ever-advancing sent-state queue) but the guard costs
+// nothing and keeps the invariant local.
+func (c *Connection) SetLastRoundtripSuccess(t time.Time) {
+	c.mu.Lock()
+	if t.After(c.lastRoundtripSuccess) {
+		c.lastRoundtripSuccess = t
+	}
+	c.mu.Unlock()
+}
+
+// maybeHopPort redials unconditionally once portHopInterval has passed since
+// both the last port change and the last confirmed round trip — mosh's fix
+// for a route that blackholes without ever returning a send error (see
+// portHopInterval's doc comment). Reports whether it actually redialed, so
+// Send can skip its own error-path redial in the same call (see there for
+// why). A failed attempt still backs lastPortChoice off by a full interval —
+// without that, a redial that keeps failing (adapter still down) would
+// retry on every single subsequent Send, stalling each one by up to
+// dialTimeout instead of failing fast and giving up for this interval.
+func (c *Connection) maybeHopPort(now time.Time) bool {
+	c.mu.Lock()
+	due := now.Sub(c.lastPortChoice) > portHopInterval && now.Sub(c.lastRoundtripSuccess) > portHopInterval
+	c.mu.Unlock()
+	if !due {
+		return false
+	}
+	if err := c.redial(); err != nil {
+		c.mu.Lock()
+		c.lastPortChoice = now
+		c.mu.Unlock()
+		return false
+	}
+	return true
 }
 
 // rawDialUDP is the actual dial primitive, indirected so tests can replace
@@ -201,6 +268,7 @@ func dialUDP(raddr *net.UDPAddr) (*net.UDPConn, error) {
 // only against the separate Recv goroutine's reads via sockMu.
 func (c *Connection) Send(payload []byte) error {
 	now := time.Now()
+	hopped := c.maybeHopPort(now)
 	c.mu.Lock()
 	reply := tsMissing
 	if c.haveSavedTimestamp && now.Sub(c.savedTimestampReceivedAt) < time.Second {
@@ -225,7 +293,13 @@ func (c *Connection) Send(payload []byte) error {
 		return err
 	}
 	err = c.write(wire)
-	if err == nil || c.closed.Load() {
+	if err == nil || c.closed.Load() || hopped {
+		// hopped means maybeHopPort already redialed this call: retrying
+		// again here would compound dialTimeout+writeTimeout twice in one
+		// Send (up to ~4s, over client.Config.ShutdownTimeout's 3s
+		// default) for a socket that's already as fresh as this call can
+		// make it. Leave it for the next call, same as any other lost
+		// packet.
 		return err
 	}
 	// Likely a stale cached route after a network blip (Windows: WSAEINVAL,

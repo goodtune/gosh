@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -131,6 +132,159 @@ func TestSendRedialsAfterSocketError(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received the redialed send")
+	}
+}
+
+// TestSendHopsPortOnSilentBlackhole reproduces the reported unrecoverable
+// case: writes never return an error (a route that blackholes rather than
+// failing, which is what a Windows adapter can do after a network change),
+// so the error-path redial in TestSendRedialsAfterSocketError never
+// triggers. Send must still redial proactively once portHopInterval has
+// passed with no confirmed round trip — mosh's PORT_HOP_INTERVAL — or the
+// session is stuck forever.
+func TestSendHopsPortOnSilentBlackhole(t *testing.T) {
+	key, _ := crypto.ParseBase64Key("zr0jtuYVKJnfJHP/XOOsbQ")
+	server, err := newLoopbackServer(t, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Dial(server.addr, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	before := conn.currentSock().LocalAddr().String()
+
+	// Backdate both timestamps past portHopInterval with no round trip ever
+	// recorded (lastRoundtripSuccess stays zero, i.e. "never") — the exact
+	// state a session reaches after a silent blackhole.
+	conn.mu.Lock()
+	conn.lastPortChoice = time.Now().Add(-portHopInterval - time.Second)
+	conn.mu.Unlock()
+
+	if err := conn.Send([]byte("probe")); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	after := conn.currentSock().LocalAddr().String()
+	if after == before {
+		t.Fatalf("Send did not hop port after a silent blackhole: still on %s", before)
+	}
+
+	select {
+	case got := <-server.received:
+		if string(got) != "probe" {
+			t.Fatalf("server got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the send from the hopped port")
+	}
+}
+
+// TestSendDoesNotHopPortAfterRecentRoundtrip guards the other half of the
+// AND condition: a stale lastPortChoice alone must not trigger a hop while
+// round trips are still succeeding — otherwise a perfectly healthy,
+// long-lived session would needlessly re-home its port every 10 seconds.
+func TestSendDoesNotHopPortAfterRecentRoundtrip(t *testing.T) {
+	key, _ := crypto.ParseBase64Key("zr0jtuYVKJnfJHP/XOOsbQ")
+	server, err := newLoopbackServer(t, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Dial(server.addr, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	before := conn.currentSock().LocalAddr().String()
+
+	conn.mu.Lock()
+	conn.lastPortChoice = time.Now().Add(-portHopInterval - time.Second)
+	conn.lastRoundtripSuccess = time.Now()
+	conn.mu.Unlock()
+
+	if err := conn.Send([]byte("probe")); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if after := conn.currentSock().LocalAddr().String(); after != before {
+		t.Fatalf("Send hopped port despite a recent round trip: %s -> %s", before, after)
+	}
+}
+
+// TestSendDoesNotHopPortRightAfterOwnHop covers the realistic state right
+// after Dial (or a previous hop): lastPortChoice is recent but no round trip
+// has confirmed the port yet (lastRoundtripSuccess still zero, "never").
+// Only a stale lastPortChoice — not lastRoundtripSuccess alone — may trigger
+// a hop, or a session would re-home its port every call until the first ack
+// ever arrives.
+func TestSendDoesNotHopPortRightAfterOwnHop(t *testing.T) {
+	key, _ := crypto.ParseBase64Key("zr0jtuYVKJnfJHP/XOOsbQ")
+	server, err := newLoopbackServer(t, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Dial(server.addr, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	before := conn.currentSock().LocalAddr().String()
+	// lastPortChoice is whatever Dial just set it to (recent); lastRoundtripSuccess
+	// is still the zero value. Send should not hop.
+	if err := conn.Send([]byte("probe")); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if after := conn.currentSock().LocalAddr().String(); after != before {
+		t.Fatalf("Send hopped port right after Dial, before lastPortChoice was even stale: %s -> %s", before, after)
+	}
+}
+
+// TestSendDoesNotDoubleRedialAfterHopping is the regression test for the
+// worst-case-latency finding on the port-hop fix: maybeHopPort's proactive
+// redial and Send's error-path redial-and-retry must not both run in the
+// same call, or Send's worst case doubles from ~2.5s to ~4s — over
+// client.Config.ShutdownTimeout's 3s default (see dialTimeout's doc
+// comment). Every dial in this test hands back an already-closed socket, so
+// a write on it always fails; if Send redialed twice, rawDialUDP would be
+// called twice.
+func TestSendDoesNotDoubleRedialAfterHopping(t *testing.T) {
+	key, _ := crypto.ParseBase64Key("zr0jtuYVKJnfJHP/XOOsbQ")
+	server, err := newLoopbackServer(t, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Dial(server.addr, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	conn.mu.Lock()
+	conn.lastPortChoice = time.Now().Add(-portHopInterval - time.Second)
+	conn.mu.Unlock()
+
+	var dials int32
+	real := rawDialUDP
+	rawDialUDP = func(raddr *net.UDPAddr) (*net.UDPConn, error) {
+		atomic.AddInt32(&dials, 1)
+		sock, err := real(raddr)
+		if err != nil {
+			return nil, err
+		}
+		sock.Close() // dead on arrival: every dial in this test yields an already-broken socket
+		return sock, nil
+	}
+	t.Cleanup(func() { rawDialUDP = real })
+
+	if err := conn.Send([]byte("probe")); err == nil {
+		t.Fatal("Send succeeded despite every dial producing a dead socket")
+	}
+	if got := atomic.LoadInt32(&dials); got != 1 {
+		t.Fatalf("Send dialed %d times in one call after already hopping, want 1 (proactive hop and error-path redial must not both run)", got)
 	}
 }
 

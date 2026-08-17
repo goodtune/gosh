@@ -35,10 +35,11 @@ internal/
                      (4 zero bytes + BE uint64, top bit = direction)
   network/           Client UDP connection: packets with 16-bit timestamp
                      echoes, SRTT/RTTVAR + RTO, replay protection, socket
-                     redial on a send failure (Windows-blip recovery), with
-                     dial/write timeouts so a wedged adapter can only delay
-                     the client's single input-handling goroutine, never
-                     block it outright
+                     redial on a send failure (Windows-blip recovery) or on
+                     mosh's PORT_HOP_INTERVAL timer (a blackholed route that
+                     never errors), with dial/write timeouts so a wedged
+                     adapter can only delay the client's single
+                     input-handling goroutine, never block it outright
   transport/         State Synchronization Protocol: sender state machine
                      (a port of mosh's TransportSender), fragmenter + zlib,
                      receiver dedup/ordering, shutdown handshake
@@ -66,7 +67,8 @@ These mirror the reference mosh implementation (`mobile-shell/mosh`); the integr
 - **Receiver rule**: gosh is deliberately *stricter* than mosh here — render and acknowledge only an instruction whose `old_num` equals the state currently displayed (`transport.Transport.latestNum`), dedupe by `new_num`, never regress the ack. mosh accepts any still-held reference state because it applies diffs to stored state copies behind a framebuffer; without one, two diffs sharing a reference would paint the shared content twice (the "wwhhoo" doubled-echo bug). Acking only rendered states makes the server re-diff from what is actually on screen. This subsumes mosh's held-state idempotency rule and is a consequence of the no-terminal-emulator design below.
 - **Shutdown** is a state numbered `-1` (max uint64), retransmitted until acked (16 tries), whichever side starts it.
 - **MTU** is 500 minus 12 (nonce tail + timestamps) minus 16 (OCB tag); the fragmenter subtracts its own 10-byte header.
-- **Roaming** relies on `mosh-server` re-learning the client's source `(addr, port)` from the last validly-authenticated packet it receives, per the reference protocol — this is what makes it safe for `internal/network.Connection`'s socket redial (a fresh local ephemeral port after a send failure) to keep a session alive rather than requiring a stable client-side port.
+- **Roaming** relies on `mosh-server` re-learning the client's source `(addr, port)` from the last validly-authenticated packet it receives, per the reference protocol — this is what makes it safe for `internal/network.Connection`'s socket redial (a fresh local ephemeral port after a send failure, or after a port hop) to keep a session alive rather than requiring a stable client-side port.
+- **Port hop timer** mirrors mosh's `PORT_HOP_INTERVAL` (10s): `Connection.Send` redials unconditionally once it's been that long since both the last port change and the last confirmed end-to-end round trip (`Connection.SetLastRoundtripSuccess`, fed by `transport.Transport.Recv`'s `NoteRoundtripSuccess` call on every version-matched, successfully reassembled instruction — not gated on the stricter `old_num`/`new_num` acceptance rule below, since even a stale-and-dropped instruction still proves the link round-trips; timestamped to when the now-acknowledged state was originally sent). This is the only defense against a route that blackholes without ever returning a send error — redial-on-error alone (see `internal/network/` below) cannot detect that case, since nothing ever fails. A one-way fault (client→server blocked, server→client heartbeats still arriving) keeps `lastRoundtripSuccess` fresh and suppresses the hop even though the session is effectively dead — mosh has the same blind spot; not fixed here.
 
 ## Design decisions
 

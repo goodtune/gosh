@@ -22,6 +22,16 @@ var pipeDialTimeout = 500 * time.Millisecond
 // SSH_AUTH_SOCK when set (Cygwin / MSYS2 emulation — Windows supports
 // AF_UNIX), then the dotvault agent named pipe (per the dotvault setting),
 // then the native OpenSSH agent pipe.
+//
+// Residual risk, accepted and documented: the named-pipe namespace is
+// machine-global and first-come-first-served, so another local user could
+// squat a pipe name before its real owner binds it. The exposure is bounded —
+// an agent client holds no key material, a rogue server sees only list/sign
+// requests (the SSH session hash, which includes the remote username) and can
+// at worst fail the auth — and this mirrors how every Windows SSH client
+// already treats the fixed openssh-ssh-agent pipe name. dotvault's own pipe
+// carries an owner-only DACL, so squatting it requires winning the race, not
+// just being present. Use --dotvault-agent off on hostile multi-user hosts.
 func dialAgents(dotvault string) []net.Conn {
 	var conns []net.Conn
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
@@ -29,7 +39,7 @@ func dialAgents(dotvault string) []net.Conn {
 			conns = append(conns, conn)
 		}
 	}
-	if pipe := resolveDotvaultEndpoint(dotvault); pipe != "" {
+	if pipe := resolveDotvaultEndpoint(dotvault, dotvaultAgentPipe); pipe != "" {
 		if conn, err := winio.DialPipe(pipe, &pipeDialTimeout); err == nil {
 			conns = append(conns, conn)
 		}
@@ -38,16 +48,4 @@ func dialAgents(dotvault string) []net.Conn {
 		conns = append(conns, conn)
 	}
 	return conns
-}
-
-func resolveDotvaultEndpoint(dotvault string) string {
-	switch dotvault {
-	case DotvaultOff:
-		return ""
-	case DotvaultAuto, "":
-		return dotvaultAgentPipe
-	default:
-		// An explicit value is used verbatim — a \\.\pipe\... name.
-		return dotvault
-	}
 }

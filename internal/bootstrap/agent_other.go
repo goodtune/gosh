@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"syscall"
 )
 
 // dialAgents connects to every reachable ssh-agent, most explicit first:
@@ -19,10 +20,12 @@ func dialAgents(dotvault string) []net.Conn {
 			conns = append(conns, conn)
 		}
 	}
-	if path := resolveDotvaultEndpoint(dotvault); path != "" {
+	if path := resolveDotvaultEndpoint(dotvault, dotvaultAgentSocket(runtime.GOOS, os.Getenv, homeDir())); path != "" {
 		// Stat first: an absent socket is the common "dotvault not running"
-		// case and skips the dial noise.
-		if _, err := os.Stat(path); err == nil {
+		// case and skips the dial noise. Require current-uid ownership — the
+		// default locations are owner-only in practice, but an auto-dialled
+		// endpoint should not trust a socket someone else planted.
+		if st, err := os.Stat(path); err == nil && ownedByCurrentUser(st) {
 			if conn, err := net.Dial("unix", path); err == nil {
 				conns = append(conns, conn)
 			}
@@ -31,13 +34,10 @@ func dialAgents(dotvault string) []net.Conn {
 	return conns
 }
 
-func resolveDotvaultEndpoint(dotvault string) string {
-	switch dotvault {
-	case DotvaultOff:
-		return ""
-	case DotvaultAuto, "":
-		return dotvaultAgentSocket(runtime.GOOS, os.Getenv, homeDir())
-	default:
-		return dotvault
+func ownedByCurrentUser(st os.FileInfo) bool {
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
 	}
+	return int(sys.Uid) == os.Getuid()
 }

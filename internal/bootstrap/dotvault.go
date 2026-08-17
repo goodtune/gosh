@@ -41,6 +41,20 @@ func dotvaultAgentSocket(goos string, getenv func(string) string, home string) s
 	}
 }
 
+// resolveDotvaultEndpoint maps the --dotvault-agent setting to an endpoint:
+// DotvaultOff (or an unresolvable default) yields "", DotvaultAuto/"" yields
+// the platform default passed in, anything else is used verbatim.
+func resolveDotvaultEndpoint(setting, autoDefault string) string {
+	switch setting {
+	case DotvaultOff:
+		return ""
+	case DotvaultAuto, "":
+		return autoDefault
+	default:
+		return setting
+	}
+}
+
 func homeDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {

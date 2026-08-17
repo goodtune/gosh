@@ -125,14 +125,15 @@ func TestUnknownFieldsIgnored(t *testing.T) {
 
 func TestTruncatedInputErrors(t *testing.T) {
 	full := (&Instruction{ProtocolVersion: 2, Diff: bytes.Repeat([]byte("x"), 50)}).Marshal()
-	for i := 1; i < len(full); i++ {
-		if _, err := UnmarshalInstruction(full[:i]); err == nil {
-			// Some prefixes are themselves valid messages (all fields
-			// optional), but a cut inside the diff length must error.
-			continue
-		}
+	// A cut inside the trailing diff bytes must error (earlier prefixes can
+	// be valid messages in their own right — every field is optional).
+	if _, err := UnmarshalInstruction(full[:len(full)-1]); err == nil {
+		t.Fatal("expected error for truncation inside diff bytes")
 	}
 	if _, err := UnmarshalInstruction([]byte{0x32, 0xFF}); err == nil {
-		t.Fatal("expected error for truncated bytes field")
+		t.Fatal("expected error for truncated bytes-field length")
+	}
+	if _, err := UnmarshalInstruction([]byte{0x08}); err == nil {
+		t.Fatal("expected error for truncated varint")
 	}
 }

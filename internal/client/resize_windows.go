@@ -23,7 +23,10 @@ func WatchResize(ctx context.Context) <-chan struct{} {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				w, h := termenv.Size(os.Stdout)
+				w, h, ok := termenv.TrySize(os.Stdout)
+				if !ok {
+					continue // transient query failure is not a resize
+				}
 				if w != lastW || h != lastH {
 					lastW, lastH = w, h
 					select {

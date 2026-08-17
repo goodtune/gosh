@@ -98,11 +98,92 @@ func TestSenderRetransmitsUntilAcked(t *testing.T) {
 	if len(conn.sent) == first {
 		t.Fatal("no retransmission after RTO")
 	}
+	// The retransmission carries the same state, so it must reuse new_num 1
+	// rather than minting a fresh state number.
+	insts := decodeSent(t, conn.sent)
+	if last := insts[len(insts)-1]; last.NewNum != 1 || last.OldNum != 0 {
+		t.Fatalf("retransmit header = old %d new %d, want old 0 new 1", last.OldNum, last.NewNum)
+	}
 
 	// Ack state 1: sender prunes and goes quiet (no diff pending).
 	tr.Sender.ProcessAcknowledgmentThrough(1)
 	if tr.Sender.sentStates[0].num != 1 {
 		t.Fatalf("front num = %d, want 1", tr.Sender.sentStates[0].num)
+	}
+}
+
+func TestSenderStateQueueTrim(t *testing.T) {
+	conn := &fakeConn{mtu: 472}
+	tr := New(conn, func([]byte) error { return nil })
+
+	// Push far more than 32 unacked states; each Tick sends one new state
+	// once the pacing clock is backdated.
+	for i := 0; i < 100; i++ {
+		tr.UserStream().PushKeys([]byte{byte('a' + i%26)})
+		for j := range tr.Sender.sentStates {
+			tr.Sender.sentStates[j].sentAt = tr.Sender.sentStates[j].sentAt.Add(-time.Second)
+		}
+		tr.Sender.mindelayClock = time.Now().Add(-time.Second)
+		tr.Sender.haveMindelay = true
+		if err := tr.Sender.Tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(tr.Sender.sentStates); n > 32 {
+		t.Fatalf("sent-state queue grew to %d, bound is 32", n)
+	}
+	// The known-received front state must survive every trim.
+	if tr.Sender.sentStates[0].num != 0 {
+		t.Fatalf("front num = %d, want 0 (known-received state evicted)", tr.Sender.sentStates[0].num)
+	}
+	// Numbers must stay strictly increasing after middle-of-queue erasure.
+	for i := 1; i < len(tr.Sender.sentStates); i++ {
+		if tr.Sender.sentStates[i].num <= tr.Sender.sentStates[i-1].num {
+			t.Fatalf("state nums not increasing at %d: %d then %d",
+				i, tr.Sender.sentStates[i-1].num, tr.Sender.sentStates[i].num)
+		}
+	}
+	// assumedReceiverStateIdx must still be in range after trims.
+	if idx := tr.Sender.assumedReceiverStateIdx; idx < 0 || idx >= len(tr.Sender.sentStates) {
+		t.Fatalf("assumedReceiverStateIdx %d out of range (len %d)", idx, len(tr.Sender.sentStates))
+	}
+}
+
+func TestReceiverThrowawayPruning(t *testing.T) {
+	conn := &fakeConn{mtu: 472}
+	tr := New(conn, func([]byte) error { return nil })
+
+	h := &serverHarness{}
+	for i := 0; i < 5; i++ {
+		for _, p := range h.instruction(uint64(i), []byte("frame")) {
+			if err := tr.Recv(p); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Now the server says states below 4 can be discarded.
+	inst := &wire.Instruction{ProtocolVersion: 2, OldNum: 5, NewNum: 6, ThrowawayNum: 4, Diff: []byte("f6")}
+	var fr fragmenter
+	for _, f := range fr.makeFragments(inst.Marshal(), 472) {
+		if err := tr.Recv(f.marshal()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, rs := range tr.receivedStates {
+		if rs.num < 4 {
+			t.Fatalf("state %d survived throwaway_num 4", rs.num)
+		}
+	}
+	// A late instruction referencing a pruned state must now be ignored.
+	late := &wire.Instruction{ProtocolVersion: 2, OldNum: 2, NewNum: 7, Diff: []byte("stale")}
+	applied := len(tr.receivedStates)
+	for _, f := range fr.makeFragments(late.Marshal(), 472) {
+		if err := tr.Recv(f.marshal()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(tr.receivedStates) != applied {
+		t.Fatal("instruction from pruned reference state was accepted")
 	}
 }
 

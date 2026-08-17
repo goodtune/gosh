@@ -67,14 +67,11 @@ type Result struct {
 var connectRE = regexp.MustCompile(`(?m)^MOSH CONNECT (\d{1,5}) ([A-Za-z0-9/+]{22})\s*$`)
 
 // AgentAuth returns an ssh.AuthMethod backed by the running ssh-agent, or nil
-// if none is reachable (SSH_AUTH_SOCK unset or dead).
+// if none is reachable. On Unix that means SSH_AUTH_SOCK; on Windows the
+// native OpenSSH agent's named pipe is tried as well (agent_windows.go).
 func AgentAuth() ssh.AuthMethod {
-	sock := os.Getenv("SSH_AUTH_SOCK")
-	if sock == "" {
-		return nil
-	}
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
+	conn := dialAgent()
+	if conn == nil {
 		return nil
 	}
 	return ssh.PublicKeysCallback(agent.NewClient(conn).Signers)
@@ -121,12 +118,12 @@ func Run(opts Options) (*Result, error) {
 	out, err := session.CombinedOutput(serverCommand(opts))
 	output := string(out)
 	if err != nil {
-		return nil, fmt.Errorf("mosh-server failed: %w\n%s", err, strings.TrimSpace(output))
+		return nil, fmt.Errorf("mosh-server failed: %w\n%s", err, strings.TrimSpace(RedactKeys(output)))
 	}
 
 	m := connectRE.FindStringSubmatch(output)
 	if m == nil {
-		return nil, fmt.Errorf("bootstrap: no MOSH CONNECT line in server output:\n%s", strings.TrimSpace(output))
+		return nil, fmt.Errorf("bootstrap: no MOSH CONNECT line in server output:\n%s", strings.TrimSpace(RedactKeys(output)))
 	}
 	udpPort, err := strconv.Atoi(m[1])
 	if err != nil || udpPort < 1 || udpPort > 65535 {
@@ -148,8 +145,15 @@ func Run(opts Options) (*Result, error) {
 		Addr:         net.JoinHostPort(host, strconv.Itoa(udpPort)),
 		Port:         udpPort,
 		Key:          key,
-		ServerOutput: output,
+		ServerOutput: RedactKeys(output),
 	}, nil
+}
+
+// RedactKeys blanks the session key out of MOSH CONNECT lines so server
+// output can be surfaced in errors and diagnostics without leaking the
+// credential into terminals or logs.
+func RedactKeys(output string) string {
+	return connectRE.ReplaceAllString(output, "MOSH CONNECT $1 <key redacted>")
 }
 
 // serverCommand builds the remote command line. The TERM/LANG environment

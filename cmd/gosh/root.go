@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	osuser "os/user"
 	"runtime"
 	"strings"
 	"syscall"
@@ -22,14 +23,12 @@ import (
 )
 
 type rootOptions struct {
-	sshPort     int
-	udpPort     string
-	server      string
-	identity    string
-	knownHosts  string
-	hostKey     string
-	noRawMode   bool
-	predictNote bool
+	sshPort    int
+	udpPort    string
+	server     string
+	identity   string
+	knownHosts string
+	hostKey    string
 }
 
 func newRootCmd() *cobra.Command {
@@ -67,6 +66,15 @@ func splitTarget(target string) (user, host string) {
 	u := os.Getenv("USER")
 	if u == "" {
 		u = os.Getenv("USERNAME") // Windows
+	}
+	if u == "" {
+		if cur, err := osuser.Current(); err == nil {
+			u = cur.Username
+			// Windows reports DOMAIN\user; the remote account is the bare name.
+			if i := strings.LastIndexByte(u, '\\'); i >= 0 {
+				u = u[i+1:]
+			}
+		}
 	}
 	return u, target
 }
@@ -146,6 +154,8 @@ func runSession(ctx context.Context, opts *rootOptions, target string, remoteCmd
 
 // runClient attaches the local terminal to an established session.
 func runClient(ctx context.Context, addr string, key crypto.Base64Key) error {
+	// SIGTERM is never delivered on Windows (os.Interrupt covers Ctrl-C
+	// there); listing it is harmless and gives Unix a clean-shutdown path.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -201,6 +211,9 @@ func newConnectCmd() *cobra.Command {
 			if keyStr == "" {
 				return errors.New("MOSH_KEY environment variable is not set")
 			}
+			// Scrub the credential from our environment (and any children's)
+			// for the session's lifetime, as reference mosh does.
+			_ = os.Unsetenv("MOSH_KEY")
 			key, err := crypto.ParseBase64Key(keyStr)
 			if err != nil {
 				return err

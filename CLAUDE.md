@@ -64,6 +64,7 @@ These mirror the reference mosh implementation (`mobile-shell/mosh`); the integr
 ## Design decisions
 
 - **No terminal emulator.** The reference client applies server diffs to a local framebuffer and re-renders; gosh writes the diff's `hoststring` bytes straight to the terminal — the diff language *is* ANSI escape sequences. Consequence: diffs are only applied for monotonically increasing state numbers (`transport.Transport.latestNum`) since we cannot re-derive an older screen. This is the main deliberate divergence from mosh, and what predictive echo would require revisiting.
+- **Client retries indefinitely.** mosh's sender gates retransmission on `last_heard + ACTIVE_RETRY_TIMEOUT` (a server-quiescence concern); the gosh sender always retries and `RemoteHeard` is bookkeeping-only. A client with pending input has a human attached — giving up silently would be worse than retrying.
 - **Hand-rolled proto2 codec** (`internal/wire`) instead of protoc + generated code: the three messages are tiny and frozen since 2012; fixture tests pin the exact bytes.
 - **`x/crypto/ssh`, not the system ssh binary**, so Windows needs nothing installed. TERM/LANG ride as quoted env-assignment prefixes on the remote command line (sshd exec goes through the login shell), because `AcceptEnv` can't be assumed.
 - **Escape sequence** is fixed at Ctrl-^ (`.` quits, doubled sends literal). Disabled automatically for non-TTY stdin so scripted/piped sessions pass bytes through untouched.

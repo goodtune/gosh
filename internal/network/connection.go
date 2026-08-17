@@ -82,6 +82,9 @@ func (c *Connection) Send(payload []byte) error {
 	if c.haveSavedTimestamp && now.Sub(c.savedTimestampReceivedAt) < time.Second {
 		// Echo the received timestamp advanced by our hold time.
 		reply = c.savedTimestamp + uint16(now.Sub(c.savedTimestampReceivedAt).Milliseconds())
+		if reply == tsMissing { // never collide with the "no reply" sentinel
+			reply++
+		}
 		c.haveSavedTimestamp = false
 	}
 	p := Packet{

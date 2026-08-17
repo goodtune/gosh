@@ -127,18 +127,12 @@ func (s *Session) Run(ctx context.Context) error {
 		for {
 			payload, err := s.conn.Recv(250 * time.Millisecond)
 			if err != nil {
-				var nerr net.Error
-				if errors.As(err, &nerr) && nerr.Timeout() {
-					continue
-				}
-				if errors.Is(err, network.ErrOldSequence) || errors.Is(err, crypto.ErrShortDatagram) {
-					continue
-				}
 				if errors.Is(err, net.ErrClosed) {
 					return
 				}
-				// Forged/garbled datagrams are noise on an open UDP port;
-				// drop them and keep listening.
+				// Everything else — read timeouts, replayed sequence numbers,
+				// forged or garbled datagrams — is noise on an open UDP port;
+				// drop it and keep listening.
 				continue
 			}
 			select {
@@ -159,6 +153,10 @@ func (s *Session) Run(ctx context.Context) error {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
+	// ctxDone is nilled once cancellation is handled, so the closed channel
+	// doesn't win every subsequent select and busy-spin the shutdown loop.
+	ctxDone := ctx.Done()
+
 	for {
 		// Let the sender do any due work, then sleep until its next deadline.
 		if err := s.tr.Sender.Tick(); err != nil {
@@ -171,7 +169,6 @@ func (s *Session) Run(ctx context.Context) error {
 		}
 		if s.tr.Sender.ShutdownInProgress() {
 			if s.tr.Sender.ShutdownAcknowledged() || s.tr.Sender.ShutdownAckTimedOut() ||
-				s.tr.RemoteShutdown() && s.ackedRemoteShutdown() ||
 				time.Since(shutdownFrom) > s.cfg.ShutdownTimeout {
 				return fatal
 			}
@@ -193,13 +190,12 @@ func (s *Session) Run(ctx context.Context) error {
 		timer.Reset(wait)
 
 		select {
-		case <-ctx.Done():
-			if !quitRequested {
-				quitRequested = true
-				s.tr.Sender.StartShutdown()
-				shutdownFrom = time.Now()
-				fatal = ctx.Err()
-			}
+		case <-ctxDone:
+			ctxDone = nil
+			quitRequested = true
+			s.tr.Sender.StartShutdown()
+			shutdownFrom = time.Now()
+			fatal = ctx.Err()
 		case b := <-input:
 			keys := b
 			if !s.cfg.DisableEscape {
@@ -217,7 +213,7 @@ func (s *Session) Run(ctx context.Context) error {
 				if errors.Is(err, transport.ErrVersionMismatch) {
 					return err
 				}
-				// Anything else is a malformed datagram; ignore it.
+				// Any other decode failure is a malformed datagram; drop it.
 			}
 		case <-s.resized():
 			w, h := s.cfg.Size()
@@ -225,16 +221,6 @@ func (s *Session) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
-}
-
-// ackedRemoteShutdown reports whether our shutdown-ack made it out: once the
-// remote started shutdown and our sender has entered shutdown, the handshake
-// completes when the sender's shutdown state is acknowledged or we simply
-// have nothing further pending. The remote closing first (logout) is the
-// common case: it retransmits until our ack lands, so a short local linger
-// suffices; the ShutdownTimeout above is the backstop.
-func (s *Session) ackedRemoteShutdown() bool {
-	return s.tr.Sender.ShutdownAcknowledged()
 }
 
 func (s *Session) resized() <-chan struct{} {

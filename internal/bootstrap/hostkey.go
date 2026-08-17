@@ -39,8 +39,14 @@ func DefaultKnownHostsPath() (string, error) {
 // file. An empty path uses the default location; the file (and ~/.ssh) is
 // created on demand under accept-new.
 func HostKeyCallback(policy HostKeyPolicy, path string) (ssh.HostKeyCallback, error) {
-	if policy == PolicyInsecure {
+	switch policy {
+	case PolicyStrict, PolicyAcceptNew:
+	case PolicyInsecure:
 		return ssh.InsecureIgnoreHostKey(), nil //nolint:gosec // explicit opt-in
+	default:
+		// A security-posture flag must not degrade on a typo.
+		return nil, fmt.Errorf("unknown host key policy %q (valid: %s, %s, %s)",
+			policy, PolicyStrict, PolicyAcceptNew, PolicyInsecure)
 	}
 	if path == "" {
 		var err error
@@ -93,7 +99,10 @@ func acceptNew(verify ssh.HostKeyCallback, path string) ssh.HostKeyCallback {
 		if _, ferr := f.WriteString(line); ferr != nil {
 			return fmt.Errorf("append to known_hosts: %w", ferr)
 		}
-		fmt.Fprintf(os.Stderr, "gosh: permanently added %s (%s) to known hosts\r\n", hostname, key.Type())
+		// Show the fingerprint like OpenSSH's accept-new does, so the trust
+		// decision is at least visible and verifiable out of band.
+		fmt.Fprintf(os.Stderr, "gosh: permanently added %s (%s %s) to known hosts\r\n",
+			hostname, key.Type(), ssh.FingerprintSHA256(key))
 		return nil
 	}
 }

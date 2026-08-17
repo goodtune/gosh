@@ -10,6 +10,11 @@ updates:
         patterns:
           - "*"
 
+  - package-ecosystem: docker
+    directory: /test/integration/testdata
+    schedule:
+      interval: weekly
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

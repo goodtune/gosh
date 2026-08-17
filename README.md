@@ -2,7 +2,7 @@
 
 A [mosh](https://mosh.org) (mobile shell) client written in pure Go.
 
-gosh speaks the mosh protocol — SSH bootstrap, then AES-128-OCB3-sealed UDP datagrams carrying mosh's State Synchronization Protocol — with no cgo and no external dependencies, so a single static binary cross-compiles to every platform Go supports, **including Windows**, where the reference mosh client has never shipped natively.
+gosh speaks the mosh protocol — SSH bootstrap, then AES-128-OCB3-sealed UDP datagrams carrying mosh's State Synchronization Protocol — with no cgo and no system dependencies (not even an ssh binary), so a single static binary cross-compiles to every platform Go supports, **including Windows**, where the reference mosh client has never shipped natively.
 
 ## Usage
 
@@ -13,7 +13,7 @@ gosh -i ~/.ssh/id_ed25519 user@host
 gosh -p 60001 user@host        # request a fixed server UDP port
 ```
 
-Quit with `Ctrl-^` then `.` (send a literal `Ctrl-^` by pressing it twice). The session survives roaming between networks, laptop sleep, and flaky links — that's the point of mosh.
+Quit with `Ctrl-^` then `.` (send a literal `Ctrl-^` by pressing it twice); escape processing is disabled when stdin is not a TTY, so piped sessions pass bytes through untouched. The session survives roaming between networks, laptop sleep, and flaky links — that's the point of mosh.
 
 SSH authentication tries, in order: an explicit `-i` identity file, the running ssh-agent, and an interactive password prompt. Host keys verify against `~/.ssh/known_hosts` with `accept-new` semantics by default (`--host-key-policy strict|accept-new|insecure`).
 

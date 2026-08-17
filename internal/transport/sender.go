@@ -222,10 +222,17 @@ func (s *sender) sendEmptyAck(now time.Time) error {
 func (s *sender) addSentState(now time.Time, num uint64, state *statesync.UserStream) {
 	s.sentStates = append(s.sentStates, timestampedState{sentAt: now, num: num, state: state})
 	if len(s.sentStates) > 32 {
-		// Erase a state from the middle of the queue, exactly like mosh:
-		// keep the front (known-received) and the most recent 16.
-		cut := len(s.sentStates) - 16
-		s.sentStates = append(s.sentStates[:cut-1], s.sentStates[cut:]...)
+		// Erase one state from the middle of the queue, like mosh: keep the
+		// front (known-received) and the 15 most recent (mosh erases the
+		// element 16 from the end).
+		eraseIdx := len(s.sentStates) - 16
+		s.sentStates = append(s.sentStates[:eraseIdx], s.sentStates[eraseIdx+1:]...)
+		// The erase shifts later indices down; keep assumedReceiverStateIdx
+		// pointing at a valid, no-newer element (it is recomputed every
+		// calculateTimers, but sendInFragments may read it before then).
+		if s.assumedReceiverStateIdx >= eraseIdx && s.assumedReceiverStateIdx > 0 {
+			s.assumedReceiverStateIdx--
+		}
 	}
 }
 

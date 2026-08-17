@@ -1,0 +1,39 @@
+version: 2
+
+builds:
+  - id: gosh
+    main: ./cmd/gosh
+    binary: gosh
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_amd64
+      - darwin_arm64
+      - windows_amd64
+      - windows_arm64
+
+archives:
+  - formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"

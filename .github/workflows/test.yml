@@ -1,0 +1,44 @@
+name: Test
+
+on:
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Go unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test -race ./...
+
+      - name: Build binary
+        run: CGO_ENABLED=0 go build -o gosh ./cmd/gosh
+
+      - name: Verify binary runs
+        run: ./gosh version
+
+      - name: Cross-compile all release targets
+        run: make build-all
+
+  integration-tests:
+    name: Integration tests (sshd + mosh-server container)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Run integration tests
+        run: make integration-test

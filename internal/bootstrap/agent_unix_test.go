@@ -101,6 +101,42 @@ func TestAgentAuthDotvaultOff(t *testing.T) {
 	}
 }
 
+// TestDialOwnAgentRejectsForeignSocket drives the branch that actually
+// matters for the trust check: a live, reachable agent socket whose owner is
+// not us must be refused outright. Proving that needs a uid that isn't ours,
+// which a test machine doesn't have — so currentUID is bent instead. Every
+// platform funnels its verdict through it (peer credentials on linux/darwin,
+// the socket file's owner elsewhere), so this exercises the real rejection
+// path on all of them, not a stub.
+func TestDialOwnAgentRejectsForeignSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.sock")
+	serveKeyring(t, path)
+
+	conn := dialOwnAgent(path)
+	if conn == nil {
+		t.Fatal("dialOwnAgent rejected our own agent socket, before any uid was bent")
+	}
+	conn.Close()
+
+	orig := currentUID
+	t.Cleanup(func() { currentUID = orig })
+	currentUID = func() int { return orig() + 1 }
+
+	if conn := dialOwnAgent(path); conn != nil {
+		conn.Close()
+		t.Fatal("dialOwnAgent accepted an agent socket served by another uid")
+	}
+}
+
+// TestDialOwnAgentAbsentSocket pins the common "dotvault not running" case:
+// a missing socket is skipped quietly, not reported as a failure.
+func TestDialOwnAgentAbsentSocket(t *testing.T) {
+	if conn := dialOwnAgent(filepath.Join(t.TempDir(), "absent.sock")); conn != nil {
+		conn.Close()
+		t.Fatal("dialOwnAgent returned a connection for a nonexistent socket")
+	}
+}
+
 func TestAgentAuthExplicitDotvaultPath(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "custom.sock")
 	pub := serveKeyring(t, sock)

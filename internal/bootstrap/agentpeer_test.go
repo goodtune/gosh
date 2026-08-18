@@ -10,11 +10,10 @@ import (
 )
 
 // dialSelfServedAgent serves an agent on a fresh socket and connects to it,
-// returning the client end. The filename is kept short: a darwin temp dir
-// plus a long name runs at the 104-byte sun_path limit.
+// returning the client end.
 func dialSelfServedAgent(t *testing.T) (*net.UnixConn, string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "a.sock")
+	path := filepath.Join(sockDir(t), "a.sock")
 	serveKeyring(t, path)
 	conn, err := net.Dial("unix", path)
 	if err != nil {

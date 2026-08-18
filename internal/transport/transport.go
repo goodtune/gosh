@@ -66,6 +66,7 @@ func (t *Transport) Recv(payload []byte) error {
 
 	t.Sender.ProcessAcknowledgmentThrough(inst.AckNum)
 	t.Sender.RemoteHeard(time.Now())
+	t.Sender.NoteRoundtripSuccess()
 
 	if inst.NewNum == ShutdownNum {
 		// The server is shutting down (logout). Note the intent immediately

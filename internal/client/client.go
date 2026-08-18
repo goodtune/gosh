@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"time"
 
 	"github.com/goodtune/gosh/internal/crypto"
@@ -127,7 +126,7 @@ func (s *Session) Run(ctx context.Context) error {
 		for {
 			payload, err := s.conn.Recv(250 * time.Millisecond)
 			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
+				if s.conn.Closed() {
 					return
 				}
 				// Everything else — read timeouts, replayed sequence numbers,
@@ -159,9 +158,16 @@ func (s *Session) Run(ctx context.Context) error {
 
 	for {
 		// Let the sender do any due work, then sleep until its next deadline.
-		if err := s.tr.Sender.Tick(); err != nil {
-			return fmt.Errorf("client: send: %w", err)
-		}
+		//
+		// Tick's only failure mode is network.Connection.Send (a UDP write),
+		// which already retried once via a socket redial. A link that's down
+		// for longer than that must not end the session: the sentStates
+		// bookkeeping behind the failed send still advanced as if it went
+		// out, so the sender's own retransmission timers retry the same
+		// state on a later tick, exactly like a lost UDP packet — the same
+		// "retry indefinitely" treatment as every other transient network
+		// condition here.
+		_ = s.tr.Sender.Tick()
 
 		if s.tr.RemoteShutdown() && !s.tr.Sender.ShutdownInProgress() {
 			s.tr.Sender.StartShutdown()

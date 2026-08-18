@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
@@ -10,17 +11,26 @@ import (
 
 // fakeConn captures sent payloads and returns canned link parameters.
 type fakeConn struct {
-	sent [][]byte
-	mtu  int
+	sent    [][]byte
+	mtu     int
+	sendErr error // when set, Send fails instead of recording the payload
+
+	roundtripSuccesses []time.Time
 }
 
 func (f *fakeConn) Send(p []byte) error {
+	if f.sendErr != nil {
+		return f.sendErr
+	}
 	f.sent = append(f.sent, append([]byte(nil), p...))
 	return nil
 }
 func (f *fakeConn) SRTT() float64          { return 100 }
 func (f *fakeConn) Timeout() time.Duration { return 200 * time.Millisecond }
 func (f *fakeConn) MTU() int               { return f.mtu }
+func (f *fakeConn) SetLastRoundtripSuccess(t time.Time) {
+	f.roundtripSuccesses = append(f.roundtripSuccesses, t)
+}
 
 func decodeSent(t *testing.T, payloads [][]byte) []*wire.Instruction {
 	t.Helper()
@@ -242,6 +252,91 @@ func TestTransportAppliesServerDiffsInOrder(t *testing.T) {
 	}
 }
 
+// TestRecvReportsRoundtripSuccess pins the mosh-parity plumbing behind the
+// proactive port-hop timer (network.Connection.maybeHopPort): every accepted
+// instruction must report the just-acknowledged state's original send time
+// to the connection layer, mirroring mosh's
+// Connection::set_last_roundtrip_success(sender.get_sent_state_acked_timestamp()).
+// Without this, a route that blackholes without ever erroring on send has no
+// signal telling it to redial.
+func TestRecvReportsRoundtripSuccess(t *testing.T) {
+	conn := &fakeConn{mtu: 472}
+	tr := New(conn, func([]byte) error { return nil })
+
+	tr.UserStream().PushKeys([]byte("x"))
+	if err := tr.Sender.Tick(); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &serverHarness{ackNum: 1}
+	for _, p := range h.instruction(0, nil) {
+		if err := tr.Recv(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if len(conn.roundtripSuccesses) == 0 {
+		t.Fatal("Recv did not report a round trip success to the connection")
+	}
+	want := tr.Sender.sentStates[0].sentAt
+	if got := conn.roundtripSuccesses[len(conn.roundtripSuccesses)-1]; !got.Equal(want) {
+		t.Fatalf("reported timestamp = %v, want sentStates[0].sentAt = %v", got, want)
+	}
+}
+
+// TestSendEmptyAckFailureDoesNotHotLoopOrGrowState is the regression test
+// for the second bug in the same report: sendEmptyAck used to append a new
+// sentStates entry and leave nextAckTime in the past on a failed send, so a
+// persistently failing link (or, before the port-hop fix above, any Tick
+// call at all while blackholed) would grow sentStates and retry as fast as
+// the caller loops.
+func TestSendEmptyAckFailureDoesNotHotLoopOrGrowState(t *testing.T) {
+	conn := &fakeConn{mtu: 472, sendErr: errors.New("write failed")}
+	tr := New(conn, func([]byte) error { return nil })
+
+	initialLen := len(tr.Sender.sentStates)
+
+	if err := tr.Sender.Tick(); err == nil {
+		t.Fatal("Tick did not surface the send failure")
+	}
+	if got := len(tr.Sender.sentStates); got != initialLen {
+		t.Fatalf("sentStates grew from %d to %d on a failed send", initialLen, got)
+	}
+	if !tr.Sender.nextAckTime.After(time.Now()) {
+		t.Fatal("nextAckTime left in the past after a failed send: next Tick would hot-loop")
+	}
+
+	// A second, immediate Tick must not retry yet or grow state again —
+	// before the fix, nextAckTime never advanced, so this would do both.
+	if err := tr.Sender.Tick(); err != nil {
+		t.Fatalf("second immediate Tick errored (hot-loop retry): %v", err)
+	}
+	if got := len(tr.Sender.sentStates); got != initialLen {
+		t.Fatalf("sentStates grew to %d after a second immediate Tick", got)
+	}
+}
+
+// TestSendToReceiverFailureDoesNotCommitNewState is the sendToReceiver
+// counterpart to the sendEmptyAck test above, flagged by review as the same
+// bug class left in place: minting a new state number for a diff that never
+// left the wire. Unlike sendEmptyAck this path didn't hot-loop (back.sentAt
+// already advanced before the send attempt kept pacing sane), but it still
+// permanently committed a phantom sentStates entry on every failed attempt.
+func TestSendToReceiverFailureDoesNotCommitNewState(t *testing.T) {
+	conn := &fakeConn{mtu: 472, sendErr: errors.New("write failed")}
+	tr := New(conn, func([]byte) error { return nil })
+
+	initialLen := len(tr.Sender.sentStates)
+	tr.UserStream().PushKeys([]byte("x")) // currentState now differs from back.state
+
+	if err := tr.Sender.Tick(); err == nil {
+		t.Fatal("Tick did not surface the send failure")
+	}
+	if got := len(tr.Sender.sentStates); got != initialLen {
+		t.Fatalf("sentStates grew from %d to %d on a failed send", initialLen, got)
+	}
+}
+
 func TestTransportIgnoresDuplicateAndOrphanStates(t *testing.T) {
 	conn := &fakeConn{mtu: 472}
 	var applied int
@@ -399,5 +494,70 @@ func TestFragmentationRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(back.Diff, big) {
 		t.Fatal("reassembled diff mismatch")
+	}
+}
+
+// slowConn is senderConn with an artificial per-Send delay, standing in for
+// a network.Connection.Send call that's slow but not outright erroring
+// (e.g. every fragment individually surviving its own dial/write timeout
+// budget, one after another).
+type slowConn struct {
+	mtu   int
+	delay time.Duration
+	sent  int
+}
+
+func (f *slowConn) Send(p []byte) error {
+	f.sent++
+	time.Sleep(f.delay)
+	return nil
+}
+func (f *slowConn) SRTT() float64                       { return 100 }
+func (f *slowConn) Timeout() time.Duration              { return 200 * time.Millisecond }
+func (f *slowConn) MTU() int                            { return f.mtu }
+func (f *slowConn) SetLastRoundtripSuccess(t time.Time) {}
+
+// TestSendInFragmentsRespectsBurstDeadline is the regression test for the
+// per-fragment multiplication bug: a diff that fragments into many pieces
+// must not multiply each fragment's own worst-case network latency by the
+// fragment count, since Tick runs synchronously on client.Session.Run's
+// single input-handling goroutine. Before maxSendBurst existed, this test
+// would take fragments*delay (tens of seconds); with it, sendInFragments
+// bails out once over budget and leaves the rest for the next scheduled
+// retransmission.
+func TestSendInFragmentsRespectsBurstDeadline(t *testing.T) {
+	const delay = 400 * time.Millisecond
+	conn := &slowConn{mtu: 60, delay: delay}
+	tr := New(conn, func([]byte) error { return nil })
+
+	// Incompressible pseudorandom bytes, large enough at this MTU to
+	// fragment into far more pieces than maxSendBurst/delay allows through.
+	big := make([]byte, 4000)
+	state := uint32(0x2545F491)
+	for i := range big {
+		state = state*1664525 + 1013904223
+		big[i] = byte(state >> 24)
+	}
+	tr.UserStream().PushKeys(big)
+
+	start := time.Now()
+	if err := tr.Sender.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > maxSendBurst+delay+time.Second {
+		t.Fatalf("Tick took %s, want roughly bounded by maxSendBurst (%s)", elapsed, maxSendBurst)
+	}
+	// A full transmission at this MTU needs far more than maxSendBurst/delay
+	// fragments (4000 incompressible bytes over a ~50-byte payload budget is
+	// on the order of 80); bound sent loosely on the deadline math alone so
+	// this doesn't depend on reconstructing the exact wire bytes (chaff
+	// varies fragment count by a byte or two run to run).
+	if maxAllowed := int(maxSendBurst/delay) + 2; conn.sent > maxAllowed {
+		t.Fatalf("sent %d fragments, want at most ~%d given a %s deadline and %s delay", conn.sent, maxAllowed, maxSendBurst, delay)
+	}
+	if conn.sent < 2 {
+		t.Fatalf("sent only %d fragment(s); test didn't exercise multi-fragment bailout", conn.sent)
 	}
 }

@@ -47,6 +47,18 @@ type Options struct {
 	// HostKeyCallback validates the server host key. Required.
 	HostKeyCallback ssh.HostKeyCallback
 
+	// KnownHostsPath, when set, is read to prefer the host key algorithms
+	// already recorded there for this host, the way OpenSSH does — otherwise
+	// a host known under one algorithm can fail to verify because the server
+	// was asked for a different one (see knownHostKeyAlgorithms). Preference
+	// only: nothing becomes unnegotiable, so leaving it empty is safe and
+	// merely forgoes the reordering. Note the asymmetry with HostKeyCallback's
+	// path argument, which does read the default location when empty: here
+	// empty means "derive nothing", so a caller that never named a file never
+	// has one read behind its back. Pass DefaultKnownHostsPath explicitly to
+	// get the usual location.
+	KnownHostsPath string
+
 	// Timeout bounds the TCP connect (default 10s).
 	Timeout time.Duration
 }
@@ -133,13 +145,16 @@ func Run(opts Options) (*Result, error) {
 		timeout = 10 * time.Second
 	}
 
+	addr := net.JoinHostPort(opts.Host, strconv.Itoa(port))
 	cfg := &ssh.ClientConfig{
 		User:            opts.User,
 		Auth:            opts.Auth,
 		HostKeyCallback: opts.HostKeyCallback,
-		Timeout:         timeout,
+		// Derived here rather than by the caller so it uses the same addr
+		// the dial does, port default included.
+		HostKeyAlgorithms: knownHostKeyAlgorithms(opts.KnownHostsPath, addr),
+		Timeout:           timeout,
 	}
-	addr := net.JoinHostPort(opts.Host, strconv.Itoa(port))
 	client, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("ssh %s: %w", addr, err)

@@ -47,6 +47,43 @@ func TestAgentPeerUIDSurvivesPathRemoval(t *testing.T) {
 	}
 }
 
+// TestDialOwnAgentRejectsSymlinkedForeignSocket answers the symlink variant
+// of the reported race directly. The attack plants a symlink where the agent
+// socket belongs: an owner check that stats the path follows the link to
+// some victim-owned file and passes, and the dial that follows resolves the
+// link a second time — so flipping it in between lands the connection on the
+// attacker's socket. Here the path is a symlink and the peer reads as
+// another uid; the connection must still be refused. Nothing about the path,
+// symlink or not, can buy the attacker anything, because the verdict comes
+// from the peer on the far end of the socket that was actually opened.
+func TestDialOwnAgentRejectsSymlinkedForeignSocket(t *testing.T) {
+	dir := sockDir(t)
+	real := filepath.Join(dir, "r.sock")
+	serveKeyring(t, real)
+
+	link := filepath.Join(dir, "l.sock")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// Through the symlink, our own agent is still reachable and accepted:
+	// gosh does not reject symlinks here, it just doesn't trust them.
+	conn := dialOwnAgent(link)
+	if conn == nil {
+		t.Fatal("dialOwnAgent refused a symlink to our own agent socket")
+	}
+	conn.Close()
+
+	orig := currentUID
+	t.Cleanup(func() { currentUID = orig })
+	currentUID = func() int { return orig() + 1 }
+
+	if conn := dialOwnAgent(link); conn != nil {
+		conn.Close()
+		t.Fatal("dialOwnAgent accepted a symlinked socket served by another uid: the symlink bypassed the ownership check")
+	}
+}
+
 // TestAgentPeerUIDFailsClosedOnDeadConn pins that agentPeerUID is a real
 // syscall against the socket rather than something reconstructed from our
 // own process. A closed fd is the one input whose peer credentials cannot be

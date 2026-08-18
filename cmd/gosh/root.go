@@ -126,10 +126,30 @@ func authMethods(opts *rootOptions, user, host string) ([]ssh.AuthMethod, error)
 	return methods, nil
 }
 
+// knownHostsPathForPreference suppresses the host key algorithm preference
+// when host key checking is off; see bootstrap.Options.KnownHostsPath.
+func knownHostsPathForPreference(policy, path string) string {
+	if bootstrap.HostKeyPolicy(policy) == bootstrap.PolicyInsecure {
+		return ""
+	}
+	return path
+}
+
 func runSession(ctx context.Context, opts *rootOptions, target string, remoteCmd []string) error {
 	user, host := splitTarget(target)
 
-	hostKeyCB, err := bootstrap.HostKeyCallback(bootstrap.HostKeyPolicy(opts.hostKey), opts.knownHosts)
+	// Resolve the default location here rather than leaving it to
+	// HostKeyCallback, so the same file backs both the verification and the
+	// host key algorithm preference derived from it. A failure to resolve is
+	// not fatal at this point: passing "" lets HostKeyCallback resolve it and
+	// report the error properly.
+	knownHostsPath := opts.knownHosts
+	if knownHostsPath == "" {
+		if p, perr := bootstrap.DefaultKnownHostsPath(); perr == nil {
+			knownHostsPath = p
+		}
+	}
+	hostKeyCB, err := bootstrap.HostKeyCallback(bootstrap.HostKeyPolicy(opts.hostKey), knownHostsPath)
 	if err != nil {
 		return err
 	}
@@ -147,6 +167,10 @@ func runSession(ctx context.Context, opts *rootOptions, target string, remoteCmd
 		RemoteCommand:   remoteCmd,
 		Auth:            auth,
 		HostKeyCallback: hostKeyCB,
+		// Left empty under the insecure policy: nothing is verified, so
+		// there is no preference worth deriving and no reason to read the
+		// file at all.
+		KnownHostsPath: knownHostsPathForPreference(opts.hostKey, knownHostsPath),
 	})
 	if err != nil {
 		return err

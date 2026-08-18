@@ -32,6 +32,11 @@ var pipeDialTimeout = 500 * time.Millisecond
 // already treats the fixed openssh-ssh-agent pipe name. dotvault's own pipe
 // carries an owner-only DACL, so squatting it requires winning the race, not
 // just being present. Use --dotvault-agent off on hostile multi-user hosts.
+//
+// This is a platform limit, not an oversight: the Unix side verifies the
+// serving process's euid from the connected socket (see agent_other.go and
+// agentpeer_peercred.go), which has no cheap equivalent for a named pipe
+// reached through winio.
 func dialAgents(dotvault string) []net.Conn {
 	var conns []net.Conn
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {

@@ -9,8 +9,16 @@ permissions:
 
 jobs:
   unit-tests:
-    name: Go unit tests
-    runs-on: ubuntu-latest
+    # macOS is in the matrix because the agent-socket trust check is
+    # per-platform syscall code (LOCAL_PEERCRED) that cross-compiling only
+    # proves compiles. It fails closed, so a darwin-only regression would
+    # silently drop dotvault support rather than break a build.
+    name: Go unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -28,6 +36,7 @@ jobs:
         run: ./gosh version
 
       - name: Cross-compile all release targets
+        if: matrix.os == 'ubuntu-latest'
         run: make build-all
 
   integration-tests:

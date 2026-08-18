@@ -14,6 +14,21 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 )
 
+// sockDir returns a temp dir whose path is short enough to hold a Unix
+// socket. t.TempDir() bakes the test's own name and a random suffix into the
+// path, and on darwin roots that at /var/folders/<32 chars>/T — together
+// they overrun sockaddr_un.sun_path's 104 bytes and every bind fails with
+// EINVAL. /tmp is POSIX, and short on both platforms.
+func sockDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "gosh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
 // serveKeyring serves an in-memory ssh-agent (one fresh Ed25519 key) on a
 // Unix socket at path, returning the key's public half.
 func serveKeyring(t *testing.T, path string) ssh.PublicKey {
@@ -51,13 +66,13 @@ func serveKeyring(t *testing.T, path string) ssh.PublicKey {
 // at the default location is discovered and its identities offered, alongside
 // the SSH_AUTH_SOCK agent's.
 func TestAgentAuthAggregatesDotvaultSocket(t *testing.T) {
-	rt := t.TempDir()
+	rt := sockDir(t)
 	if err := os.MkdirAll(filepath.Join(rt, "dotvault"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	dotvaultPub := serveKeyring(t, filepath.Join(rt, "dotvault", "agent.sock"))
 
-	authSock := filepath.Join(t.TempDir(), "ssh-agent.sock")
+	authSock := filepath.Join(sockDir(t), "ssh-agent.sock")
 	envPub := serveKeyring(t, authSock)
 
 	t.Setenv("XDG_RUNTIME_DIR", rt)
@@ -85,7 +100,7 @@ func TestAgentAuthAggregatesDotvaultSocket(t *testing.T) {
 }
 
 func TestAgentAuthDotvaultOff(t *testing.T) {
-	rt := t.TempDir()
+	rt := sockDir(t)
 	if err := os.MkdirAll(filepath.Join(rt, "dotvault"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -101,11 +116,47 @@ func TestAgentAuthDotvaultOff(t *testing.T) {
 	}
 }
 
+// TestDialOwnAgentRejectsForeignSocket drives the branch that actually
+// matters for the trust check: a live, reachable agent socket whose owner is
+// not us must be refused outright. Proving that needs a uid that isn't ours,
+// which a test machine doesn't have — so currentUID is bent instead. Every
+// platform funnels its verdict through it (peer credentials on linux/darwin,
+// the socket file's owner elsewhere), so this exercises the real rejection
+// path on all of them, not a stub.
+func TestDialOwnAgentRejectsForeignSocket(t *testing.T) {
+	path := filepath.Join(sockDir(t), "a.sock")
+	serveKeyring(t, path)
+
+	conn := dialOwnAgent(path)
+	if conn == nil {
+		t.Fatal("dialOwnAgent rejected our own agent socket, before any uid was bent")
+	}
+	conn.Close()
+
+	orig := currentUID
+	t.Cleanup(func() { currentUID = orig })
+	currentUID = func() int { return orig() + 1 }
+
+	if conn := dialOwnAgent(path); conn != nil {
+		conn.Close()
+		t.Fatal("dialOwnAgent accepted an agent socket served by another uid")
+	}
+}
+
+// TestDialOwnAgentAbsentSocket pins the common "dotvault not running" case:
+// a missing socket is skipped quietly, not reported as a failure.
+func TestDialOwnAgentAbsentSocket(t *testing.T) {
+	if conn := dialOwnAgent(filepath.Join(sockDir(t), "absent.sock")); conn != nil {
+		conn.Close()
+		t.Fatal("dialOwnAgent returned a connection for a nonexistent socket")
+	}
+}
+
 func TestAgentAuthExplicitDotvaultPath(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "custom.sock")
+	sock := filepath.Join(sockDir(t), "custom.sock")
 	pub := serveKeyring(t, sock)
 	t.Setenv("SSH_AUTH_SOCK", "")
-	t.Setenv("XDG_RUNTIME_DIR", t.TempDir()) // empty dir: no default socket
+	t.Setenv("XDG_RUNTIME_DIR", sockDir(t)) // empty dir: no default socket
 
 	callback := agentSigners(sock)
 	if callback == nil {

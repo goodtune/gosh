@@ -20,8 +20,8 @@ RUN useradd -m -s /bin/bash gosh \
         'AcceptEnv LANG LC_*' \
         > /etc/ssh/sshd_config.d/gosh-test.conf
 
-# The fixed UDP port the test asks mosh-server to bind (-p 60001), so the
-# container runtime can map it deterministically.
-EXPOSE 22/tcp 60001/udp
+# The fixed UDP ports the tests ask mosh-server to bind (-p 60001 and up), so
+# the container runtime can map them deterministically.
+EXPOSE 22/tcp 60001/udp 60002/udp 60003/udp
 
 CMD ["/usr/sbin/sshd", "-D", "-e"]

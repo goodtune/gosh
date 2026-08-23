@@ -11,6 +11,7 @@ gosh user@host                 # connect, run your login shell
 gosh user@host -- tmux new -A  # run a command instead of the shell
 gosh -i ~/.ssh/id_ed25519 user@host
 gosh -p 60001 user@host        # request a fixed server UDP port
+gosh --clipboard off user@host # keep OSC 52 clipboard writes off your terminal
 ```
 
 Quit with `Ctrl-^` then `.` (send a literal `Ctrl-^` by pressing it twice); escape processing is disabled when stdin is not a TTY, so piped sessions pass bytes through untouched. The session survives roaming between networks, laptop sleep, and flaky links — that's the point of mosh. Sends and (re)dials are time-bounded, so a blip can't freeze the client itself, only delay it; the client also recovers from a route that silently stops delivering without ever erroring (which is what a Wi-Fi/Ethernet switch or sleep/resume can leave behind, especially on Windows) by re-homing to a fresh local port after 10 seconds with no confirmed round trip, the same way the reference mosh client does.
@@ -20,6 +21,33 @@ SSH authentication tries, in order: an explicit `-i` identity file, every reacha
 `gosh connect <ip> <port>` attaches directly to a running mosh-server, reading the session key from `$MOSH_KEY` — the same contract as the reference `mosh-client` binary.
 
 The remote host needs `mosh-server` installed (it's in every distro's `mosh` package) and UDP reachability on the negotiated port (60000–61000 by default).
+
+## Clipboard (OSC 52)
+
+Copying inside a remote session reaches your local clipboard through an escape sequence — `ESC ] 52 ; Pc ; <base64> BEL`, xterm's OSC 52 — that the remote program writes to your terminal. gosh forwards those sequences to the terminal it is attached to, so a remote editor's yank lands in your system clipboard the way it does over ssh. Your terminal has to implement OSC 52 for any of this to work: Windows Terminal does (a classic conhost window — `cmd.exe` or PowerShell outside Windows Terminal — does not, and macOS Terminal.app does not either, while iTerm2 does once you allow it). A terminal that ignores the sequence fails silently, and nothing gosh can do changes that; the probe below tells you which side is at fault.
+
+`--clipboard` sets the policy:
+
+* `write` (the default) — clipboard writes are forwarded, and a write that names no selection (`52;;…`, xterm's "primary plus cut buffer 0") is normalised to the system clipboard (`52;c;…`), which is what the copying program meant. Clipboard *read* queries (`ESC ] 52 ; c ; ? BEL`) are dropped, and any answer a terminal sends anyway is stripped from your keystrokes before they leave: mosh-server relays such a query rather than answering it, and a terminal that does answer replies on gosh's stdin — which goes straight back to the remote host — so without this, anything running on the far end could ask for a copy of your local clipboard at will.
+* `full` — read queries are forwarded and local input is relayed untouched, leaving the decision to your terminal. Windows Terminal and Terminal.app never answer a read query, so this changes nothing there; use it only for a remote host you would trust with your clipboard contents.
+* `off` — no OSC 52 reaches your terminal at all.
+
+To check the path end to end, run this inside a session; your local clipboard should end up holding `gosh-clipboard`:
+
+```sh
+printf '\033]52;c;%s\007' "$(printf gosh-clipboard | base64)"
+```
+
+**tmux copies need one line of config, on the remote host.** mosh-server's terminal emulator only recognises a clipboard write that names the clipboard explicitly (`52;c;`), and tmux's copy-mode emits the empty-selection form (`52;;`) — so mosh-server discards a tmux copy before any client sees it. That is a mosh-server limitation, not a gosh one; it hits the reference mosh client identically. In the `~/.tmux.conf` of the host you connect *to*, where copy-mode actually runs:
+
+```tmux
+set -g set-clipboard on
+set -as terminal-overrides ',*:Ms=\E]52;%p1%.0sc;%p2%s\7'
+```
+
+`%p1%.0s` swallows the selection tmux would have written (it is empty) and hardcodes `c` in its place, so every tmux copy names the clipboard. Do not use the shorter `Ms=\E]52;c;%p2%s\7` that circulates for this: dropping `%p1` altogether leaves the capability with a parameter tmux still passes, and tmux then emits nothing at all — verified on tmux 3.4, where the form above delivers the copy through mosh-server to gosh and the shorter one silently drops it.
+
+mosh-server also caps the sequence at 16 KiB, so a single copy larger than roughly 12 KB of text arrives truncated.
 
 ## How it works
 

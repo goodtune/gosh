@@ -62,6 +62,17 @@ type Session struct {
 	// diffs so a filtered write costs no per-diff allocation.
 	clip *osc52.Filter
 	out  []byte
+
+	// clipIn guards the other end of the same boundary: if a clipboard read
+	// query reaches the terminal by any route, the terminal's answer comes
+	// back as local input, and forwarding that is the actual leak. It is nil
+	// under the Full policy, which asks for exactly that transparency. Input
+	// is filtered chunk by chunk — never held across reads — because a person
+	// typing ESC ] 5 2 ; must not have their keystrokes swallowed waiting for
+	// a terminator that will never come; a terminal's answer arrives in one
+	// write, which is what this catches.
+	clipIn *osc52.Filter
+	in     []byte
 }
 
 // New dials the server and prepares the session.
@@ -77,6 +88,9 @@ func New(cfg Config) (*Session, error) {
 		return nil, err
 	}
 	s := &Session{cfg: cfg, conn: conn, clip: osc52.New(cfg.Clipboard)}
+	if cfg.Clipboard != osc52.Full {
+		s.clipIn = osc52.New(osc52.Off)
+	}
 	s.tr = transport.New(conn, s.apply)
 	return s, nil
 }
@@ -225,6 +239,7 @@ func (s *Session) Run(ctx context.Context) error {
 			if !s.cfg.DisableEscape {
 				keys, quitRequested = s.processEscapes(b, &escapePending)
 			}
+			keys = s.filterInput(keys)
 			if len(keys) > 0 {
 				s.tr.UserStream().PushKeys(keys)
 			}
@@ -245,6 +260,17 @@ func (s *Session) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+}
+
+// filterInput strips clipboard traffic from local input, so a terminal that
+// answered a clipboard read query cannot deliver the answer to the remote
+// host. Under the Full policy the input rides through untouched.
+func (s *Session) filterInput(keys []byte) []byte {
+	if s.clipIn == nil || len(keys) == 0 {
+		return keys
+	}
+	s.in = s.clipIn.FilterChunk(s.in[:0], keys)
+	return s.in
 }
 
 func (s *Session) resized() <-chan struct{} {

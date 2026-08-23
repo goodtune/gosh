@@ -24,10 +24,12 @@ The remote host needs `mosh-server` installed (it's in every distro's `mosh` pac
 
 ## Clipboard (OSC 52)
 
-Copying inside a remote session reaches your local clipboard through an escape sequence — `ESC ] 52 ; Pc ; <base64> BEL`, xterm's OSC 52 — that the remote program writes to your terminal. gosh forwards those sequences to the terminal it is attached to, so a remote editor's yank lands in the Windows/macOS/X11 clipboard exactly as it does over ssh. `--clipboard` sets the policy:
+Copying inside a remote session reaches your local clipboard through an escape sequence — `ESC ] 52 ; Pc ; <base64> BEL`, xterm's OSC 52 — that the remote program writes to your terminal. gosh forwards those sequences to the terminal it is attached to, so a remote editor's yank lands in your system clipboard the way it does over ssh. Your terminal has to implement OSC 52 for any of this to work: Windows Terminal does (a classic conhost window — `cmd.exe` or PowerShell outside Windows Terminal — does not, and macOS Terminal.app does not either, while iTerm2 does once you allow it). A terminal that ignores the sequence fails silently, and nothing gosh can do changes that; the probe below tells you which side is at fault.
 
-* `write` (the default) — clipboard writes are forwarded, and a write that names no selection (`52;;…`, xterm's "primary plus cut buffer 0") is normalised to the system clipboard (`52;c;…`), which is what the copying program meant. Clipboard *read* queries (`ESC ] 52 ; c ; ? BEL`) are dropped: mosh-server relays them verbatim, and a terminal that answers one replies on gosh's stdin — which goes straight back to the remote host — so anything running on the far end could otherwise ask for a copy of your local clipboard at will.
-* `full` — read queries are forwarded as well, leaving the decision to the terminal (most gate or refuse it). Use this only for a remote host you trust with your clipboard contents.
+`--clipboard` sets the policy:
+
+* `write` (the default) — clipboard writes are forwarded, and a write that names no selection (`52;;…`, xterm's "primary plus cut buffer 0") is normalised to the system clipboard (`52;c;…`), which is what the copying program meant. Clipboard *read* queries (`ESC ] 52 ; c ; ? BEL`) are dropped, and any answer a terminal sends anyway is stripped from your keystrokes before they leave: mosh-server relays such a query rather than answering it, and a terminal that does answer replies on gosh's stdin — which goes straight back to the remote host — so without this, anything running on the far end could ask for a copy of your local clipboard at will.
+* `full` — read queries are forwarded and local input is relayed untouched, leaving the decision to your terminal. Windows Terminal and Terminal.app never answer a read query, so this changes nothing there; use it only for a remote host you would trust with your clipboard contents.
 * `off` — no OSC 52 reaches your terminal at all.
 
 To check the path end to end, run this inside a session; your local clipboard should end up holding `gosh-clipboard`:
@@ -36,7 +38,7 @@ To check the path end to end, run this inside a session; your local clipboard sh
 printf '\033]52;c;%s\007' "$(printf gosh-clipboard | base64)"
 ```
 
-**tmux copies need one line of config.** mosh-server's terminal emulator only recognises a clipboard write that names the clipboard explicitly (`52;c;`), and tmux's copy-mode emits the empty-selection form (`52;;`) — so mosh-server discards a tmux copy before any client sees it. That is a mosh-server limitation, not a gosh one; it hits the reference mosh client identically. Teach tmux to name the selection and copies flow again:
+**tmux copies need one line of config, on the remote host.** mosh-server's terminal emulator only recognises a clipboard write that names the clipboard explicitly (`52;c;`), and tmux's copy-mode emits the empty-selection form (`52;;`) — so mosh-server discards a tmux copy before any client sees it. That is a mosh-server limitation, not a gosh one; it hits the reference mosh client identically. In the `~/.tmux.conf` of the host you connect *to*, where copy-mode actually runs:
 
 ```tmux
 set -g set-clipboard on

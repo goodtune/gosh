@@ -291,16 +291,21 @@ func TestClipboardEndToEnd(t *testing.T) {
 		write = "\x1b]52;c;Z29zaC1jbGlwYm9hcmQ=\x07" // base64 of "gosh-clipboard"
 		query = "\x1b]52;c;?\x07"
 	)
-	for _, cmd := range []string{
-		`printf '\033]52;c;Z29zaC1jbGlwYm9hcmQ=\007'`,
-		`printf '\033]52;c;?\007'`,
-		`echo clipboard-probe-complete`,
+	// One step at a time, each waiting on a marker the server can only print
+	// after the sequence: the clipboard is *state* in mosh's terminal, so a
+	// query sent before the write has been diffed to the client would
+	// overwrite it and the write would never reach the wire. The markers are
+	// computed by the shell so the echo of the command line cannot satisfy
+	// the wait.
+	for _, step := range []struct{ cmd, marker string }{
+		{`printf '\033]52;c;Z29zaC1jbGlwYm9hcmQ=\007'; echo clip-write-$((6*7))`, "clip-write-42"},
+		{`printf '\033]52;c;?\007'; echo clip-query-$((7*8))`, "clip-query-56"},
 	} {
-		if _, err := inW.Write([]byte(cmd + "\r")); err != nil {
+		if _, err := inW.Write([]byte(step.cmd + "\r")); err != nil {
 			t.Fatal(err)
 		}
+		out.waitFor(t, step.marker, 30*time.Second)
 	}
-	out.waitFor(t, "clipboard-probe-complete", 30*time.Second)
 
 	if !strings.Contains(out.String(), write) {
 		t.Errorf("clipboard write did not reach the terminal; output:\n%q", out.String())

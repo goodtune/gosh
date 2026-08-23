@@ -103,14 +103,50 @@ func TestFilter(t *testing.T) {
 			want: "\x1b\x1b]52;c;aGk=\x07",
 		},
 		{
-			name: "CAN aborts the sequence and releases it verbatim",
+			name: "CAN drops the unfinished sequence",
 			in:   "\x1b]52;c;aGk=\x18rest",
-			want: "\x1b]52;c;aGk=\x18rest",
+			want: "rest",
 		},
 		{
-			name: "ESC that is not ST aborts the sequence",
+			name: "ESC that is not ST drops the unfinished sequence",
 			in:   "\x1b]52;c;aGk=\x1b[0m",
-			want: "\x1b]52;c;aGk=\x1b[0m",
+			want: "\x1b[0m",
+		},
+		{
+			name: "an unterminated sequence cannot smuggle the next one past the policy",
+			in:   "\x1b]52;c;\x1b]52;c;?\x07",
+			want: "",
+		},
+		{
+			name:   "an unterminated sequence is dropped under off, not streamed",
+			policy: Off,
+			in:     "\x1b]52;c;aGk=\x1b]52;c;YQ==\x07tail",
+			want:   "tail",
+		},
+		{
+			name: "a leading-zero OSC number is still OSC 52",
+			in:   "\x1b]052;c;?\x07x",
+			want: "x",
+		},
+		{
+			name: "a leading-zero write is normalized to the canonical number",
+			in:   "\x1b]052;;YQ==\x07",
+			want: "\x1b]52;c;YQ==\x07",
+		},
+		{
+			name: "a query with no selection is a query",
+			in:   "\x1b]52;;?\x07",
+			want: "",
+		},
+		{
+			name: "an ST-terminated query is dropped too",
+			in:   "\x1b]52;c;?\x1b\\",
+			want: "",
+		},
+		{
+			name: "an over-long OSC number is somebody else's sequence",
+			in:   "\x1b]000000052;c;?\x07",
+			want: "\x1b]000000052;c;?\x07",
 		},
 		{
 			name: "back-to-back sequences are handled independently",
@@ -150,20 +186,40 @@ func TestFilterTrailingPartialIsHeld(t *testing.T) {
 	}
 }
 
-// TestFilterOversizedSequenceIsReleased keeps a server (or a hostile one)
-// from making the client buffer without bound: past the cap the sequence is
-// released verbatim and filtering resumes.
-func TestFilterOversizedSequenceIsReleased(t *testing.T) {
-	payload := strings.Repeat("A", maxSequence+1024)
-	in := "\x1b]52;c;" + payload + "\x07tail"
-	got := run(Write, in)
-	if got != in {
-		t.Fatalf("oversized sequence was not passed through verbatim (got %d bytes, want %d)", len(got), len(in))
+// TestFilterOversizedSequenceIsDropped keeps a hostile server from making the
+// client buffer without bound *and* from using length to slip a sequence past
+// the policy: past the cap the rest is consumed and discarded, and filtering
+// resumes on the next sequence.
+func TestFilterOversizedSequenceIsDropped(t *testing.T) {
+	oversized := "\x1b]52;c;" + strings.Repeat("A", maxSequence+1024) + "\x07"
+	if got := run(Write, oversized+"tail"); got != "tail" {
+		t.Fatalf("oversized sequence leaked %d bytes: %.80q", len(got), got)
 	}
-	// Filtering must still work afterwards.
-	got = run(Write, in+"\x1b]52;c;?\x07")
-	if got != in {
-		t.Fatalf("filtering did not resume after an oversized sequence: %q", got[len(in):])
+	if got := run(Off, oversized+"tail"); got != "tail" {
+		t.Fatalf("oversized sequence leaked past the off policy: %.80q", got)
+	}
+	if got := run(Write, oversized+"\x1b]52;c;?\x07\x1b]52;;YQ==\x07"); got != "\x1b]52;c;YQ==\x07" {
+		t.Fatalf("filtering did not resume after an oversized sequence: %q", got)
+	}
+}
+
+// TestFilterChunkDoesNotWithholdInput pins the contract the input path needs:
+// an incomplete sequence is passed through rather than held, so a person
+// typing ESC ] 5 2 ; does not lose their keystrokes, while a complete
+// sequence arriving in one read — how a terminal answers a clipboard query —
+// is still filtered.
+func TestFilterChunkDoesNotWithholdInput(t *testing.T) {
+	f := New(Off)
+	var out []byte
+	for _, chunk := range []string{"\x1b", "]", "5", "2", ";"} {
+		out = f.FilterChunk(out, []byte(chunk))
+	}
+	if string(out) != "\x1b]52;" {
+		t.Fatalf("typed prefix was withheld: %q", out)
+	}
+	out = f.FilterChunk(nil, []byte("\x1b]52;c;c2VjcmV0\x07"))
+	if len(out) != 0 {
+		t.Fatalf("complete sequence in one chunk was not filtered: %q", out)
 	}
 }
 

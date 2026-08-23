@@ -58,13 +58,20 @@ func newRootCmd() *cobra.Command {
 		"host key policy: strict, accept-new, or insecure")
 	root.Flags().StringVar(&opts.dotvault, "dotvault-agent", bootstrap.DotvaultAuto,
 		"dotvault SSH agent endpoint: auto (default location), off, or an explicit socket/pipe path")
-	// Persistent so `gosh connect` gets it too: both paths end in runClient.
-	root.PersistentFlags().StringVar(&opts.clipboard, "clipboard", osc52.Write.String(),
-		"OSC 52 clipboard handling: write (remote may set the local clipboard), full (remote may also read it), or off")
+	addClipboardFlag(root, opts)
 
 	root.AddCommand(newVersionCmd(), newConnectCmd(opts))
 	root.CompletionOptions.DisableDefaultCmd = true
 	return root
+}
+
+// addClipboardFlag registers --clipboard on a command that ends in
+// runClient. Both session paths need it and `version` does not, which rules
+// out a persistent flag on the root.
+func addClipboardFlag(cmd *cobra.Command, opts *rootOptions) {
+	cmd.Flags().StringVar(&opts.clipboard, "clipboard", osc52.Write.String(),
+		"OSC 52 clipboard handling: write (the remote may set the local clipboard), "+
+			"full (it may also read it), or off")
 }
 
 func splitTarget(target string) (user, host string) {
@@ -264,6 +271,7 @@ func newConnectCmd(opts *rootOptions) *cobra.Command {
 			return runClient(cmd.Context(), net.JoinHostPort(args[0], args[1]), key, clipboard)
 		},
 	}
+	addClipboardFlag(cmd, opts)
 	return cmd
 }
 

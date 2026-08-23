@@ -12,6 +12,7 @@ import (
 
 	"github.com/goodtune/gosh/internal/crypto"
 	"github.com/goodtune/gosh/internal/network"
+	"github.com/goodtune/gosh/internal/osc52"
 	"github.com/goodtune/gosh/internal/transport"
 	"github.com/goodtune/gosh/internal/wire"
 )
@@ -41,6 +42,11 @@ type Config struct {
 	// DisableEscape turns off Ctrl-^ escape processing (scripted sessions).
 	DisableEscape bool
 
+	// Clipboard is the OSC 52 policy applied to terminal bytes from the
+	// server. The zero value forwards clipboard writes and refuses clipboard
+	// read queries.
+	Clipboard osc52.Policy
+
 	// ShutdownTimeout bounds the closing handshake (default 3s).
 	ShutdownTimeout time.Duration
 }
@@ -50,6 +56,12 @@ type Session struct {
 	cfg  Config
 	conn *network.Connection
 	tr   *transport.Transport
+
+	// clip and out belong to the diff-applying path, which runs on the one
+	// goroutine that calls transport.Transport.Recv; out is reused across
+	// diffs so a filtered write costs no per-diff allocation.
+	clip *osc52.Filter
+	out  []byte
 }
 
 // New dials the server and prepares the session.
@@ -64,24 +76,30 @@ func New(cfg Config) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cfg: cfg, conn: conn}
+	s := &Session{cfg: cfg, conn: conn, clip: osc52.New(cfg.Clipboard)}
 	s.tr = transport.New(conn, s.apply)
 	return s, nil
 }
 
-// apply renders one server diff: terminal bytes go to Output verbatim (the
-// diff language *is* the terminal's escape-sequence language), resizes and
-// echo acks are bookkeeping only.
+// apply renders one server diff: terminal bytes go to Output as they came
+// (the diff language *is* the terminal's escape-sequence language) except for
+// OSC 52 clipboard sequences, which the configured policy may rewrite or
+// drop; resizes and echo acks are bookkeeping only.
 func (s *Session) apply(diff []byte) error {
 	events, err := wire.UnmarshalHostMessage(diff)
 	if err != nil {
 		return fmt.Errorf("client: bad host message: %w", err)
 	}
 	for _, ev := range events {
-		if len(ev.Bytes) > 0 {
-			if _, err := s.cfg.Output.Write(ev.Bytes); err != nil {
-				return err
-			}
+		if len(ev.Bytes) == 0 {
+			continue
+		}
+		s.out = s.clip.Filter(s.out[:0], ev.Bytes)
+		if len(s.out) == 0 {
+			continue
+		}
+		if _, err := s.cfg.Output.Write(s.out); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -53,7 +53,7 @@ func startRig(t *testing.T) *rig {
 			FromDockerfile: testcontainers.FromDockerfile{
 				Context: "testdata",
 			},
-			ExposedPorts: []string{"22/tcp", "60001/udp", "60002/udp"},
+			ExposedPorts: []string{"22/tcp", "60001/udp", "60002/udp", "60003/udp"},
 			WaitingFor:   wait.ForListeningPort("22/tcp").WithStartupTimeout(2 * time.Minute),
 		}
 		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -71,7 +71,7 @@ func startRig(t *testing.T) *rig {
 			return
 		}
 		r.sshPort = int(sshMapped.Num())
-		for _, p := range []string{"60001", "60002"} {
+		for _, p := range []string{"60001", "60002", "60003"} {
 			mapped, err := container.MappedPort(ctx, p+"/udp")
 			if err != nil {
 				rigErr = err
@@ -253,4 +253,71 @@ func buildGosh(t *testing.T) string {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 	return bin
+}
+
+// TestClipboardEndToEnd pins the OSC 52 clipboard path through a real
+// mosh-server: a clipboard write reaches the client's terminal untouched,
+// while the read query that mosh-server happily relays does not — answering
+// it would put the local clipboard on the wire back to the remote host.
+func TestClipboardEndToEnd(t *testing.T) {
+	r := startRig(t)
+	addr, res := bootstrapSession(t, r, "60003")
+
+	inR, inW := io.Pipe()
+	var out syncBuffer
+
+	session, err := client.New(client.Config{
+		Addr:          addr,
+		Key:           res.Key,
+		Input:         inR,
+		Output:        &out,
+		Size:          func() (int, int) { return 120, 40 },
+		DisableEscape: true,
+	})
+	if err != nil {
+		t.Fatalf("client.New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- session.Run(ctx) }()
+
+	out.waitFor(t, "$", 30*time.Second)
+
+	// Typed as backslash escapes, so the shell's echo of the command line
+	// cannot be mistaken for the sequences themselves.
+	const (
+		write = "\x1b]52;c;Z29zaC1jbGlwYm9hcmQ=\x07" // base64 of "gosh-clipboard"
+		query = "\x1b]52;c;?\x07"
+	)
+	for _, cmd := range []string{
+		`printf '\033]52;c;Z29zaC1jbGlwYm9hcmQ=\007'`,
+		`printf '\033]52;c;?\007'`,
+		`echo clipboard-probe-complete`,
+	} {
+		if _, err := inW.Write([]byte(cmd + "\r")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out.waitFor(t, "clipboard-probe-complete", 30*time.Second)
+
+	if !strings.Contains(out.String(), write) {
+		t.Errorf("clipboard write did not reach the terminal; output:\n%q", out.String())
+	}
+	if strings.Contains(out.String(), query) {
+		t.Errorf("clipboard read query was forwarded to the terminal; output:\n%q", out.String())
+	}
+
+	if _, err := inW.Write([]byte("exit\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("session.Run: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatalf("session did not shut down after exit; output:\n%s", out.String())
+	}
 }

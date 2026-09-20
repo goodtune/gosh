@@ -13,11 +13,13 @@ gosh speaks the mosh protocol — SSH bootstrap, then AES-128-OCB3-sealed UDP da
 
 <img src="https://raw.githubusercontent.com/goodtune/gosh/main/assets/gosh-icon-128.png" alt="" width="96" align="right">
 
-| OS | amd64 | arm64 | Notes |
+| OS | Release targets | Unit tests in CI | End-to-end against a real `mosh-server` |
 | --- | --- | --- | --- |
-| **Windows** | ✅ | ✅ | The primary target — no ssh binary, no Cygwin, no WSL; the reference mosh client has never shipped natively here. Built in CI; the end-to-end suite runs on Linux and macOS |
-| **macOS** | ✅ | ✅ | Built and end-to-end tested in CI |
-| **Linux** | ✅ | ✅ | Built and end-to-end tested in CI |
+| **Windows** | amd64, arm64 | ✅ `windows-latest` | ✅ native `gosh.exe` against `mosh-server` running in WSL |
+| **macOS** | amd64, arm64 | ✅ `macos-latest` | ✅ Homebrew `mosh-server` behind a throwaway sshd |
+| **Linux** | amd64, arm64 | ✅ `ubuntu-latest` | ✅ Debian sshd + `mosh-server` container (testcontainers) |
+
+Windows is the primary target: no ssh binary, no Cygwin, no WSL needed to *run* gosh — WSL appears above only because CI has to put a POSIX `mosh-server` somewhere for the Windows client to talk to, and it is the one Linux userspace a Windows runner offers. Every job runs on its runner's own architecture (arm64 on macOS, amd64 elsewhere); the other architectures are cross-compiled and not executed.
 
 Every build is `CGO_ENABLED=0`, so the same source cross-compiles to any other platform Go supports with nothing but `GOOS`/`GOARCH`.
 
@@ -52,6 +54,8 @@ make build-all      # linux/darwin/windows × amd64/arm64
 make test           # unit tests (includes RFC 7253 OCB vectors)
 make integration-test  # end-to-end against a real sshd+mosh-server container (needs Docker)
 ```
+
+`make integration-test` builds and starts that container itself. Point the same suite at an sshd you already have — a VM, a remote box, or a local `mosh-server` where Docker is not an option, which is how the macOS and Windows CI jobs reach a server — by setting `GOSH_IT_SSH_PORT` (this selects the external rig) along with `GOSH_IT_HOST`, `GOSH_IT_USER`, either `GOSH_IT_KEY` (private key file) or `GOSH_IT_PASSWORD`, and optionally `GOSH_IT_SERVER_COMMAND` when `mosh-server` is not on the PATH sshd hands a non-interactive command. The host must let the suite bind UDP 60001 and 60002.
 
 ## Status
 

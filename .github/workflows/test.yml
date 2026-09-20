@@ -194,9 +194,11 @@ jobs:
           wsl -u root sh -c "
             set -eu
             adduser -D -s /bin/ash gosh
-            # adduser leaves '!' in the shadow field, which OpenSSH reads as a
-            # locked account and refuses even for key auth. '*' is the
-            # conventional "no password, not locked" marker.
+            # adduser leaves a bang in the shadow field, which OpenSSH reads
+            # as a locked account and refuses even for key auth; a star is the
+            # conventional marker for no-password-but-not-locked. No double
+            # quotes anywhere in this script: it is itself a double-quoted
+            # argument, and one would end it early.
             sed -i 's/^gosh:!:/gosh:*:/' /etc/shadow
             mkdir -p /home/gosh/.ssh
             printf '%s\n' '$pub' > /home/gosh/.ssh/authorized_keys

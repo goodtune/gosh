@@ -19,6 +19,7 @@ import (
 	"github.com/goodtune/gosh/internal/bootstrap"
 	"github.com/goodtune/gosh/internal/client"
 	"github.com/goodtune/gosh/internal/crypto"
+	"github.com/goodtune/gosh/internal/osc52"
 	"github.com/goodtune/gosh/internal/termenv"
 )
 
@@ -30,6 +31,7 @@ type rootOptions struct {
 	knownHosts string
 	hostKey    string
 	dotvault   string
+	clipboard  string
 }
 
 func newRootCmd() *cobra.Command {
@@ -56,10 +58,20 @@ func newRootCmd() *cobra.Command {
 		"host key policy: strict, accept-new, or insecure")
 	root.Flags().StringVar(&opts.dotvault, "dotvault-agent", bootstrap.DotvaultAuto,
 		"dotvault SSH agent endpoint: auto (default location), off, or an explicit socket/pipe path")
+	addClipboardFlag(root, opts)
 
-	root.AddCommand(newVersionCmd(), newConnectCmd())
+	root.AddCommand(newVersionCmd(), newConnectCmd(opts))
 	root.CompletionOptions.DisableDefaultCmd = true
 	return root
+}
+
+// addClipboardFlag registers --clipboard on a command that ends in
+// runClient. Both session paths need it and `version` does not, which rules
+// out a persistent flag on the root.
+func addClipboardFlag(cmd *cobra.Command, opts *rootOptions) {
+	cmd.Flags().StringVar(&opts.clipboard, "clipboard", osc52.Write.String(),
+		"OSC 52 clipboard handling: write (the remote may set the local clipboard), "+
+			"full (it may also read it), or off")
 }
 
 func splitTarget(target string) (user, host string) {
@@ -138,6 +150,12 @@ func knownHostsPathForPreference(policy, path string) string {
 func runSession(ctx context.Context, opts *rootOptions, target string, remoteCmd []string) error {
 	user, host := splitTarget(target)
 
+	// Reject a bad policy before spending an SSH handshake on the session.
+	clipboard, err := osc52.ParsePolicy(opts.clipboard)
+	if err != nil {
+		return err
+	}
+
 	// Resolve the default location here rather than leaving it to
 	// HostKeyCallback, so the same file backs both the verification and the
 	// host key algorithm preference derived from it. A failure to resolve is
@@ -176,11 +194,11 @@ func runSession(ctx context.Context, opts *rootOptions, target string, remoteCmd
 		return err
 	}
 
-	return runClient(ctx, res.Addr, res.Key)
+	return runClient(ctx, res.Addr, res.Key, clipboard)
 }
 
 // runClient attaches the local terminal to an established session.
-func runClient(ctx context.Context, addr string, key crypto.Base64Key) error {
+func runClient(ctx context.Context, addr string, key crypto.Base64Key, clipboard osc52.Policy) error {
 	// SIGTERM is never delivered on Windows (os.Interrupt covers Ctrl-C
 	// there); listing it is harmless and gives Unix a clean-shutdown path.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -204,6 +222,7 @@ func runClient(ctx context.Context, addr string, key crypto.Base64Key) error {
 		Output:        os.Stdout,
 		Size:          func() (int, int) { return termenv.Size(os.Stdout) },
 		DisableEscape: !interactive,
+		Clipboard:     clipboard,
 	}
 	if interactive {
 		cfg.Resized = client.WatchResize(ctx)
@@ -225,7 +244,7 @@ func runClient(ctx context.Context, addr string, key crypto.Base64Key) error {
 	return err
 }
 
-func newConnectCmd() *cobra.Command {
+func newConnectCmd(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "connect host port",
 		Short: "Attach to a running mosh-server directly (key from $MOSH_KEY)",
@@ -234,6 +253,10 @@ func newConnectCmd() *cobra.Command {
 			"contract as the reference mosh-client binary.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			clipboard, err := osc52.ParsePolicy(opts.clipboard)
+			if err != nil {
+				return err
+			}
 			keyStr := os.Getenv("MOSH_KEY")
 			if keyStr == "" {
 				return errors.New("MOSH_KEY environment variable is not set")
@@ -245,9 +268,10 @@ func newConnectCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runClient(cmd.Context(), net.JoinHostPort(args[0], args[1]), key)
+			return runClient(cmd.Context(), net.JoinHostPort(args[0], args[1]), key, clipboard)
 		},
 	}
+	addClipboardFlag(cmd, opts)
 	return cmd
 }
 

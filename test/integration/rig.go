@@ -28,7 +28,7 @@ const (
 
 // udpPorts are the fixed container-side ports each test asks mosh-server to
 // bind, one per test so sessions never collide.
-var udpPorts = []string{"60001", "60002"}
+var udpPorts = []string{"60001", "60002", "60003"}
 
 // rig is a reachable sshd with mosh-server installed. It is either a
 // container this package starts (the default, and what `make

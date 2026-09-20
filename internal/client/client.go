@@ -12,6 +12,7 @@ import (
 
 	"github.com/goodtune/gosh/internal/crypto"
 	"github.com/goodtune/gosh/internal/network"
+	"github.com/goodtune/gosh/internal/osc52"
 	"github.com/goodtune/gosh/internal/transport"
 	"github.com/goodtune/gosh/internal/wire"
 )
@@ -41,6 +42,11 @@ type Config struct {
 	// DisableEscape turns off Ctrl-^ escape processing (scripted sessions).
 	DisableEscape bool
 
+	// Clipboard is the OSC 52 policy applied to terminal bytes from the
+	// server. The zero value forwards clipboard writes and refuses clipboard
+	// read queries.
+	Clipboard osc52.Policy
+
 	// ShutdownTimeout bounds the closing handshake (default 3s).
 	ShutdownTimeout time.Duration
 }
@@ -50,6 +56,23 @@ type Session struct {
 	cfg  Config
 	conn *network.Connection
 	tr   *transport.Transport
+
+	// clip and out belong to the diff-applying path, which runs on the one
+	// goroutine that calls transport.Transport.Recv; out is reused across
+	// diffs so a filtered write costs no per-diff allocation.
+	clip *osc52.Filter
+	out  []byte
+
+	// clipIn guards the other end of the same boundary: if a clipboard read
+	// query reaches the terminal by any route, the terminal's answer comes
+	// back as local input, and forwarding that is the actual leak. It is nil
+	// under the Full policy, which asks for exactly that transparency. Input
+	// is filtered chunk by chunk — never held across reads — because a person
+	// typing ESC ] 5 2 ; must not have their keystrokes swallowed waiting for
+	// a terminator that will never come; a terminal's answer arrives in one
+	// write, which is what this catches.
+	clipIn *osc52.Filter
+	in     []byte
 }
 
 // New dials the server and prepares the session.
@@ -64,24 +87,33 @@ func New(cfg Config) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{cfg: cfg, conn: conn}
+	s := &Session{cfg: cfg, conn: conn, clip: osc52.New(cfg.Clipboard)}
+	if cfg.Clipboard != osc52.Full {
+		s.clipIn = osc52.New(osc52.Off)
+	}
 	s.tr = transport.New(conn, s.apply)
 	return s, nil
 }
 
-// apply renders one server diff: terminal bytes go to Output verbatim (the
-// diff language *is* the terminal's escape-sequence language), resizes and
-// echo acks are bookkeeping only.
+// apply renders one server diff: terminal bytes go to Output as they came
+// (the diff language *is* the terminal's escape-sequence language) except for
+// OSC 52 clipboard sequences, which the configured policy may rewrite or
+// drop; resizes and echo acks are bookkeeping only.
 func (s *Session) apply(diff []byte) error {
 	events, err := wire.UnmarshalHostMessage(diff)
 	if err != nil {
 		return fmt.Errorf("client: bad host message: %w", err)
 	}
 	for _, ev := range events {
-		if len(ev.Bytes) > 0 {
-			if _, err := s.cfg.Output.Write(ev.Bytes); err != nil {
-				return err
-			}
+		if len(ev.Bytes) == 0 {
+			continue
+		}
+		s.out = s.clip.Filter(s.out[:0], ev.Bytes)
+		if len(s.out) == 0 {
+			continue
+		}
+		if _, err := s.cfg.Output.Write(s.out); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -207,6 +239,7 @@ func (s *Session) Run(ctx context.Context) error {
 			if !s.cfg.DisableEscape {
 				keys, quitRequested = s.processEscapes(b, &escapePending)
 			}
+			keys = s.filterInput(keys)
 			if len(keys) > 0 {
 				s.tr.UserStream().PushKeys(keys)
 			}
@@ -227,6 +260,17 @@ func (s *Session) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+}
+
+// filterInput strips clipboard traffic from local input, so a terminal that
+// answered a clipboard read query cannot deliver the answer to the remote
+// host. Under the Full policy the input rides through untouched.
+func (s *Session) filterInput(keys []byte) []byte {
+	if s.clipIn == nil || len(keys) == 0 {
+		return keys
+	}
+	s.in = s.clipIn.FilterChunk(s.in[:0], keys)
+	return s.in
 }
 
 func (s *Session) resized() <-chan struct{} {

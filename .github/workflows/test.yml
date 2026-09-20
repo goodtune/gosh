@@ -145,15 +145,13 @@ jobs:
     # one Linux userspace available here, so the server runs there while the
     # client under test stays a native Windows binary.
     #
-    # WSL 2 rather than WSL 1, even though WSL 1 would share the host network
-    # stack: openssh-server cannot install under WSL 1, whose flock() fails on
-    # /etc/passwd ("Failed to take /etc/passwd lock: Invalid argument") and
-    # takes the postinst down with it. WSL 2 is a NAT'd VM instead, and its
-    # localhost relay covers TCP only -- no use to a UDP session -- while the
-    # Hyper-V firewall drops host-to-VM traffic by default. Mirrored
-    # networking removes both problems by giving the distro the host's own
-    # interfaces; the job still probes which address answers rather than
-    # assuming the mode took effect.
+    # WSL 1, because it shares the host network stack and the mosh session is
+    # UDP: WSL 2 is a NAT'd VM whose localhost relay covers TCP only, its
+    # Hyper-V firewall drops host-to-VM traffic, and mirrored networking --
+    # which would fix both -- is unsupported on this runner and falls back to
+    # no networking at all. Alpine, because WSL 1's flock() fails on
+    # /etc/passwd, which kills any postinst that runs systemd-sysusers:
+    # Debian's openssh-server is one, Alpine has no systemd at all.
     name: Integration (Windows, WSL rig)
     runs-on: windows-latest
     steps:
@@ -168,22 +166,23 @@ jobs:
       # executes gosh.
       - uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
         with:
-          # The action's default distribution; mosh and openssh-server are
-          # both stock packages there.
-          distribution: Debian-13
-          wsl-version: 2
-          additional-packages: mosh openssh-server
+          distribution: Alpine
+          wsl-version: 1
 
-      - name: Put the distro on the host network
-        shell: pwsh
+      - name: Install mosh and sshd inside WSL
+        shell: bash
+        # Installed here rather than through the action's additional-packages
+        # because mosh lives in Alpine's community repository, which the
+        # minirootfs does not enable.
         run: |
-          @(
-            '[wsl2]'
-            'networkingMode=mirrored'
-            'firewall=false'
-          ) | Set-Content -Path "$env:USERPROFILE\.wslconfig" -Encoding ascii
-          Get-Content "$env:USERPROFILE\.wslconfig"
-          wsl --shutdown
+          set -euo pipefail
+          wsl -u root sh -c "
+            set -eu
+            grep -q '/community' /etc/apk/repositories ||
+              sed -n 's,^\(https*://.*\)/main$,\1/community,p' /etc/apk/repositories >> /etc/apk/repositories
+            apk update
+            apk add mosh openssh
+          "
 
       - name: Configure sshd inside WSL
         shell: bash
@@ -191,17 +190,16 @@ jobs:
           set -euo pipefail
           ssh-keygen -q -t ed25519 -N '' -C gosh-integration -f "$RUNNER_TEMP/client_key"
           pub=$(cat "$RUNNER_TEMP/client_key.pub")
-          wsl -u root bash -c "
+          wsl -u root sh -c "
             set -eu
-            useradd -m -s /bin/bash gosh
-            mkdir -p /home/gosh/.ssh /run/sshd /etc/ssh/sshd_config.d
+            adduser -D -s /bin/ash gosh
+            mkdir -p /home/gosh/.ssh
             printf '%s\n' '$pub' > /home/gosh/.ssh/authorized_keys
             chown -R gosh:gosh /home/gosh/.ssh
             chmod 700 /home/gosh/.ssh
             chmod 600 /home/gosh/.ssh/authorized_keys
             ssh-keygen -A
-            printf '%s\n' 'Port 2222' 'PasswordAuthentication no' \
-              > /etc/ssh/sshd_config.d/gosh-test.conf
+            printf '%s\n' 'Port 2222' 'PasswordAuthentication no' >> /etc/ssh/sshd_config
           "
 
       - name: Start sshd inside WSL
@@ -215,37 +213,29 @@ jobs:
             -RedirectStandardError "$env:RUNNER_TEMP\sshd.log" `
             -WindowStyle Hidden
 
-      - name: Find the address that answers
+      - name: Wait for sshd
         shell: pwsh
-        # Mirrored networking should make 127.0.0.1 work; NAT mode needs the
-        # distro's own address, and the Hyper-V firewall may allow neither.
-        # Probe instead of assuming, and fail loudly with what was tried.
+        # WSL 1 puts the listener on the host's own stack, so this is the
+        # loopback the tests will use; fail here rather than inside the suite.
         run: |
-          $candidates = @('127.0.0.1')
-          $vmIP = (wsl hostname -I) -replace "`r", ''
-          if ($vmIP) { $candidates += $vmIP.Trim().Split(' ')[0] }
-          Write-Host "Trying: $($candidates -join ', ')"
-          $found = $null
           foreach ($attempt in 1..30) {
-            foreach ($candidate in $candidates) {
-              $client = New-Object Net.Sockets.TcpClient
-              try {
-                if ($client.ConnectAsync($candidate, 2222).Wait(1000)) { $found = $candidate }
-              } catch { } finally { $client.Dispose() }
-              if ($found) { break }
-            }
-            if ($found) { break }
+            $client = New-Object Net.Sockets.TcpClient
+            try {
+              if ($client.ConnectAsync('127.0.0.1', 2222).Wait(1000)) {
+                Write-Host "sshd answers on 127.0.0.1:2222"
+                exit 0
+              }
+            } catch { } finally { $client.Dispose() }
             Start-Sleep -Seconds 2
           }
-          if (-not $found) { throw "no candidate address accepted a connection on 2222: $($candidates -join ', ')" }
-          Write-Host "sshd answers on $found"
-          "GOSH_IT_HOST=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          throw "sshd never accepted a connection on 127.0.0.1:2222"
 
       # The Makefile recipe verbatim: GNU make is not part of the Windows
       # runner image, so this job cannot call `make integration-test`.
       - name: Run integration tests
         shell: bash
         env:
+          GOSH_IT_HOST: 127.0.0.1
           GOSH_IT_SSH_PORT: "2222"
           GOSH_IT_USER: gosh
         run: |
@@ -257,4 +247,4 @@ jobs:
         shell: bash
         run: |
           cat "$RUNNER_TEMP/sshd.log" || true
-          wsl -u root bash -c "cat /var/log/auth.log 2>/dev/null | tail -40 || true; (ss -lntup || netstat -lnp) 2>/dev/null | head -40 || true"
+          wsl -u root sh -c "cat /var/log/messages 2>/dev/null | tail -40 || true; (ss -lntup || netstat -lnp) 2>/dev/null | head -40 || true"

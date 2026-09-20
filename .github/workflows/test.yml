@@ -203,44 +203,40 @@ jobs:
             printf '%s\n' 'Port 2222' 'PasswordAuthentication no' >> /etc/ssh/sshd_config
           "
 
-      - name: Start sshd inside WSL
+      # sshd, the wait for it, and the tests share one step on purpose: a
+      # detached wsl.exe does not outlive the step that launched it, and when
+      # it goes the distro goes with it -- which is how a run that probed a
+      # healthy listener still met "connection refused" moments later.
+      - name: Run integration tests
         shell: pwsh
-        # A distro stays alive only while it has a running process, so sshd
-        # runs in the foreground under a detached wsl.exe rather than
-        # daemonising and letting WSL tear the instance down underneath it.
+        env:
+          GOSH_IT_HOST: 127.0.0.1
+          GOSH_IT_SSH_PORT: "2222"
+          GOSH_IT_USER: gosh
         run: |
           Start-Process -FilePath wsl `
             -ArgumentList '-u','root','/usr/sbin/sshd','-D','-e' `
             -RedirectStandardError "$env:RUNNER_TEMP\sshd.log" `
             -WindowStyle Hidden
 
-      - name: Wait for sshd
-        shell: pwsh
-        # WSL 1 puts the listener on the host's own stack, so this is the
-        # loopback the tests will use; fail here rather than inside the suite.
-        run: |
+          # WSL 1 puts the listener on the host's own stack, so this is the
+          # loopback the tests will use; fail here rather than inside the
+          # suite, which cannot say whether sshd ever started.
+          $ready = $false
           foreach ($attempt in 1..30) {
             $client = New-Object Net.Sockets.TcpClient
             try {
-              if ($client.ConnectAsync('127.0.0.1', 2222).Wait(1000)) {
-                Write-Host "sshd answers on 127.0.0.1:2222"
-                exit 0
-              }
+              if ($client.ConnectAsync('127.0.0.1', 2222).Wait(1000)) { $ready = $true }
             } catch { } finally { $client.Dispose() }
+            if ($ready) { break }
             Start-Sleep -Seconds 2
           }
-          throw "sshd never accepted a connection on 127.0.0.1:2222"
+          if (-not $ready) { throw "sshd never accepted a connection on 127.0.0.1:2222" }
+          Write-Host "sshd answers on 127.0.0.1:2222"
 
-      # The Makefile recipe verbatim: GNU make is not part of the Windows
-      # runner image, so this job cannot call `make integration-test`.
-      - name: Run integration tests
-        shell: bash
-        env:
-          GOSH_IT_HOST: 127.0.0.1
-          GOSH_IT_SSH_PORT: "2222"
-          GOSH_IT_USER: gosh
-        run: |
-          export GOSH_IT_KEY="$RUNNER_TEMP/client_key"
+          $env:GOSH_IT_KEY = "$env:RUNNER_TEMP\client_key"
+          # The Makefile recipe verbatim: GNU make is not part of the Windows
+          # runner image, so this job cannot call `make integration-test`.
           go test -race -tags integration -timeout 15m ./test/integration/
 
       - name: sshd log and listeners

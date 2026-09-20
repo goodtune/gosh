@@ -1,122 +1,35 @@
 //go:build integration
 
 // Package integration validates gosh end-to-end against a genuine sshd +
-// mosh-server running in a container (testcontainers-go). Run via
-// `make integration-test`; requires a Docker daemon.
+// mosh-server. By default the rig is a container this package builds and
+// starts (testcontainers-go), which is what `make integration-test` runs and
+// needs a Docker daemon; setting GOSH_IT_SSH_PORT instead points the suite at
+// an sshd the caller started, which is how the macOS and Windows CI jobs
+// reach a mosh-server without Docker. See rig.go.
 package integration
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
-	"golang.org/x/crypto/ssh"
-
-	"github.com/goodtune/gosh/internal/bootstrap"
 	"github.com/goodtune/gosh/internal/client"
 )
 
-const (
-	sshUser     = "gosh"
-	sshPassword = "gosh-integration"
-)
-
-// rig is the shared container: one sshd, multiple mosh-server sessions on
-// distinct fixed UDP ports.
-type rig struct {
-	container testcontainers.Container
-	sshPort   int
-	udpPorts  map[string]int // container port ("60001") -> mapped host port
-}
-
-var (
-	rigOnce sync.Once
-	rigVal  *rig
-	rigErr  error
-)
-
-func startRig(t *testing.T) *rig {
-	t.Helper()
-	rigOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		req := testcontainers.ContainerRequest{
-			FromDockerfile: testcontainers.FromDockerfile{
-				Context: "testdata",
-			},
-			ExposedPorts: []string{"22/tcp", "60001/udp", "60002/udp"},
-			WaitingFor:   wait.ForListeningPort("22/tcp").WithStartupTimeout(2 * time.Minute),
-		}
-		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-			ContainerRequest: req,
-			Started:          true,
-		})
-		if err != nil {
-			rigErr = err
-			return
-		}
-		r := &rig{container: container, udpPorts: map[string]int{}}
-		sshMapped, err := container.MappedPort(ctx, "22/tcp")
-		if err != nil {
-			rigErr = err
-			return
-		}
-		r.sshPort = int(sshMapped.Num())
-		for _, p := range []string{"60001", "60002"} {
-			mapped, err := container.MappedPort(ctx, p+"/udp")
-			if err != nil {
-				rigErr = err
-				return
-			}
-			r.udpPorts[p] = int(mapped.Num())
-		}
-		rigVal = r
-	})
-	if rigErr != nil {
-		t.Fatalf("start container: %v", rigErr)
+// TestMain releases the rig once every test has finished with it.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if rigVal != nil && rigVal.close != nil {
+		rigVal.close()
 	}
-	return rigVal
-}
-
-// bootstrapSession launches mosh-server in the container on the given fixed
-// container-side UDP port and returns the host-side UDP address plus key.
-func bootstrapSession(t *testing.T, r *rig, containerPort string) (addr string, res *bootstrap.Result) {
-	t.Helper()
-	res, err := bootstrap.Run(bootstrap.Options{
-		User:            sshUser,
-		Host:            "127.0.0.1",
-		SSHPort:         r.sshPort,
-		UDPPort:         containerPort,
-		Term:            "xterm-256color",
-		Auth:            []ssh.AuthMethod{ssh.Password(sshPassword)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	})
-	if err != nil {
-		t.Fatalf("bootstrap: %v", err)
-	}
-	if res.Port != atoi(t, containerPort) {
-		t.Fatalf("mosh-server bound port %d, requested %s", res.Port, containerPort)
-	}
-	// The port mosh-server printed is container-internal; dial the mapping.
-	return fmt.Sprintf("127.0.0.1:%d", r.udpPorts[containerPort]), res
-}
-
-func atoi(t *testing.T, s string) int {
-	t.Helper()
-	var n int
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
-		t.Fatal(err)
-	}
-	return n
+	os.Exit(code)
 }
 
 // syncBuffer is a concurrency-safe output sink with substring waiting.
@@ -247,6 +160,11 @@ func TestCLIEndToEnd(t *testing.T) {
 func buildGosh(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "gosh")
+	if runtime.GOOS == "windows" {
+		// CreateProcess needs the extension; `go build -o` writes exactly the
+		// name it is given.
+		bin += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-o", bin, "github.com/goodtune/gosh/cmd/gosh")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {

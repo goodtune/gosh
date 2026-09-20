@@ -9,16 +9,17 @@ permissions:
 
 jobs:
   unit-tests:
-    # macOS is in the matrix because the agent-socket trust check is
-    # per-platform syscall code (LOCAL_PEERCRED) that cross-compiling only
-    # proves compiles. It fails closed, so a darwin-only regression would
-    # silently drop dotvault support rather than break a build.
+    # Every supported OS runs the unit suite natively: the agent-socket trust
+    # check (LOCAL_PEERCRED/SO_PEERCRED), raw-mode and VT enablement, and the
+    # resize watcher are per-platform syscall code that cross-compiling only
+    # proves compiles. They fail closed, so a platform-only regression would
+    # silently drop a feature rather than break a build.
     name: Go unit tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -29,18 +30,32 @@ jobs:
       - name: Run tests
         run: go test -race ./...
 
-      - name: Build binary
-        run: CGO_ENABLED=0 go build -o gosh ./cmd/gosh
+      - name: Build and run the binary
+        if: runner.os != 'Windows'
+        run: |
+          go build -o gosh ./cmd/gosh
+          ./gosh version
+        env:
+          CGO_ENABLED: 0
 
-      - name: Verify binary runs
-        run: ./gosh version
+      - name: Build and run the binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          go build -o gosh.exe ./cmd/gosh
+          .\gosh.exe version
+        env:
+          CGO_ENABLED: 0
 
       - name: Cross-compile all release targets
         if: matrix.os == 'ubuntu-latest'
         run: make build-all
 
-  integration-tests:
-    name: Integration tests (sshd + mosh-server container)
+  integration-linux:
+    # The reference rig: testcontainers builds test/integration/testdata into
+    # a Debian image with a real sshd and mosh-server. Only Linux runners can
+    # host a Linux container, which is also why the macOS and Windows jobs
+    # below start a server natively instead of using a service container.
+    name: Integration (Linux, container rig)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -51,3 +66,132 @@ jobs:
 
       - name: Run integration tests
         run: make integration-test
+
+  integration-macos:
+    # Docker is not available on macOS runners, so the rig is native: mosh
+    # from Homebrew plus a throwaway sshd on port 2222 that only this job's
+    # generated key can log into. That makes the macOS row of the README's
+    # platform table a tested claim rather than a cross-compile claim.
+    name: Integration (macOS, native rig)
+    runs-on: macos-latest
+    env:
+      # mosh-server rejects a non-UTF-8 locale, and gosh's fallback for an
+      # unset local LANG is C.UTF-8, which macOS does not define. Name a
+      # locale macOS actually has.
+      LANG: en_US.UTF-8
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install mosh
+        run: brew install mosh
+
+      - name: Start a throwaway sshd
+        run: |
+          set -euo pipefail
+          rig="$RUNNER_TEMP/rig"
+          mkdir -p "$rig"
+          ssh-keygen -q -t ed25519 -N '' -C gosh-integration -f "$rig/client_key"
+          ssh-keygen -q -t ed25519 -N '' -f "$rig/host_ed25519"
+          cp "$rig/client_key.pub" "$rig/authorized_keys"
+          cat > "$rig/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $rig/host_ed25519
+          AuthorizedKeysFile $rig/authorized_keys
+          PidFile $rig/sshd.pid
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM no
+          # The key material lives under RUNNER_TEMP, which is not a mode the
+          # StrictModes check accepts for a root-run sshd.
+          StrictModes no
+          LogLevel VERBOSE
+          EOF
+          sudo /usr/sbin/sshd -f "$rig/sshd_config" -E "$rig/sshd.log"
+
+      - name: Run integration tests
+        env:
+          GOSH_IT_HOST: 127.0.0.1
+          GOSH_IT_SSH_PORT: "2222"
+          # Homebrew's bin directory is not on the PATH sshd gives a
+          # non-interactive command, so name the server binary absolutely.
+          GOSH_IT_SERVER_COMMAND: /opt/homebrew/bin/mosh-server
+        run: |
+          export GOSH_IT_KEY="$RUNNER_TEMP/rig/client_key"
+          export GOSH_IT_USER="$(id -un)"
+          make integration-test
+
+      - name: sshd log
+        if: failure()
+        run: cat "$RUNNER_TEMP/rig/sshd.log" || true
+
+  integration-windows:
+    # Windows is the platform gosh exists for and the one with no mosh-server
+    # to talk to: the server side of mosh is POSIX-only, and a Windows runner
+    # can host neither a Linux container nor a service container. WSL is the
+    # one Linux userspace available here, so the server runs there while the
+    # client under test runs as a native Windows binary over the loopback
+    # both share (WSL 1 shares the host network stack, so 127.0.0.1 and UDP
+    # need no forwarding).
+    name: Integration (Windows, WSL rig)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 1
+          additional-packages: mosh openssh-server
+
+      - name: Configure sshd inside WSL
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh-keygen -q -t ed25519 -N '' -C gosh-integration -f "$RUNNER_TEMP/client_key"
+          pub=$(cat "$RUNNER_TEMP/client_key.pub")
+          wsl -u root bash -c "
+            set -eu
+            useradd -m -s /bin/bash gosh
+            mkdir -p /home/gosh/.ssh /run/sshd
+            printf '%s\n' '$pub' > /home/gosh/.ssh/authorized_keys
+            chown -R gosh:gosh /home/gosh/.ssh
+            chmod 700 /home/gosh/.ssh
+            chmod 600 /home/gosh/.ssh/authorized_keys
+            ssh-keygen -A
+            printf '%s\n' 'Port 2222' 'ListenAddress 127.0.0.1' 'PasswordAuthentication no' \
+              > /etc/ssh/sshd_config.d/gosh-test.conf
+          "
+
+      - name: Start sshd inside WSL
+        shell: pwsh
+        # A distro stays alive only while it has a running process, so sshd
+        # runs in the foreground under a detached wsl.exe rather than
+        # daemonising and letting WSL tear the instance down underneath it.
+        run: |
+          Start-Process -FilePath wsl -ArgumentList '-u','root','/usr/sbin/sshd','-D','-e' -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+
+      - name: Run integration tests
+        shell: bash
+        env:
+          GOSH_IT_HOST: 127.0.0.1
+          GOSH_IT_SSH_PORT: "2222"
+          GOSH_IT_USER: gosh
+        run: |
+          export GOSH_IT_KEY="$RUNNER_TEMP/client_key"
+          go test -race -tags integration -timeout 15m ./test/integration/
+
+      - name: WSL sshd status
+        if: failure()
+        shell: pwsh
+        run: |
+          wsl -u root bash -c "ss -lntup | head -40; journalctl -n50 --no-pager 2>/dev/null || true"

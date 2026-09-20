@@ -55,6 +55,8 @@ make test           # unit tests (includes RFC 7253 OCB vectors)
 make integration-test  # end-to-end against a real sshd+mosh-server container (needs Docker)
 ```
 
+`make integration-test` builds and starts that container itself. Point the same suite at an sshd you already have — a VM, a remote box, or a local `mosh-server` where Docker is not an option, which is how the macOS and Windows CI jobs reach a server — by setting `GOSH_IT_SSH_PORT` (this selects the external rig) along with `GOSH_IT_HOST`, `GOSH_IT_USER`, either `GOSH_IT_KEY` (private key file) or `GOSH_IT_PASSWORD`, and optionally `GOSH_IT_SERVER_COMMAND` when `mosh-server` is not on the PATH sshd hands a non-interactive command. The host must let the suite bind UDP 60001 and 60002.
+
 ## Status
 
 Interactive sessions, roaming, remote commands, resize, and clean shutdown are implemented and exercised end-to-end in CI against the reference `mosh-server`. Not yet implemented: predictive local echo (mosh's speculative rendering), IP roaming notifications in the status line, and the `MOSH_ESCAPE_KEY` override.

@@ -186,6 +186,14 @@ func dockerRig() (*rig, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Past this point the container is running but not yet reachable through
+	// a rig, so nothing else can stop it: tear it down on any error rather
+	// than leaving it for Ryuk.
+	defer func() {
+		if err != nil {
+			_ = container.Terminate(context.Background())
+		}
+	}()
 
 	r := &rig{
 		sshHost:     "127.0.0.1",
@@ -194,17 +202,24 @@ func dockerRig() (*rig, error) {
 		udpHostPort: map[string]int{},
 		close:       func() { _ = container.Terminate(context.Background()) },
 	}
-	sshMapped, err := container.MappedPort(ctx, "22/tcp")
-	if err != nil {
+	// Assign through the function's err so the deferred teardown above sees a
+	// failure; a fresh `:=` inside the loop would shadow it.
+	mappedPort := func(port string) (int, error) {
+		mapped, err := container.MappedPort(ctx, port)
+		if err != nil {
+			return 0, err
+		}
+		return int(mapped.Num()), nil
+	}
+	if r.sshPort, err = mappedPort("22/tcp"); err != nil {
 		return nil, err
 	}
-	r.sshPort = int(sshMapped.Num())
 	for _, p := range udpPorts {
-		mapped, err := container.MappedPort(ctx, p+"/udp")
-		if err != nil {
+		var hostPort int
+		if hostPort, err = mappedPort(p + "/udp"); err != nil {
 			return nil, err
 		}
-		r.udpHostPort[p] = int(mapped.Num())
+		r.udpHostPort[p] = hostPort
 	}
 	return r, nil
 }

@@ -27,6 +27,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # -race is the one place the repo's CGO_ENABLED=0 invariant does not
+      # hold: the detector needs cgo and a C toolchain. Go quietly falls back
+      # to CGO_ENABLED=0 when it cannot find one, so print what it resolved.
+      - name: Toolchain diagnostics
+        run: |
+          go env CC CGO_ENABLED
+          gcc --version || true
+
       - name: Run tests
         run: go test -race ./...
 
@@ -117,10 +125,11 @@ jobs:
         env:
           GOSH_IT_HOST: 127.0.0.1
           GOSH_IT_SSH_PORT: "2222"
-          # Homebrew's bin directory is not on the PATH sshd gives a
-          # non-interactive command, so name the server binary absolutely.
-          GOSH_IT_SERVER_COMMAND: /opt/homebrew/bin/mosh-server
         run: |
+          # Homebrew's bin directory is not on the PATH sshd gives a
+          # non-interactive command, so name the server binary absolutely —
+          # and ask brew for the prefix rather than assuming the arm64 one.
+          export GOSH_IT_SERVER_COMMAND="$(brew --prefix)/bin/mosh-server"
           export GOSH_IT_KEY="$RUNNER_TEMP/rig/client_key"
           export GOSH_IT_USER="$(id -un)"
           make integration-test
@@ -146,9 +155,14 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: Vampire/setup-wsl@v7
+      # Pinned to the v7.0.0 commit: this is the only third-party action in
+      # the repo, and it runs arbitrary code on a runner that then builds and
+      # executes gosh.
+      - uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
         with:
-          distribution: Ubuntu-24.04
+          # The action's default distribution, and the one with the most WSL 1
+          # mileage behind it.
+          distribution: Debian-13
           wsl-version: 1
           additional-packages: mosh openssh-server
 
@@ -161,7 +175,7 @@ jobs:
           wsl -u root bash -c "
             set -eu
             useradd -m -s /bin/bash gosh
-            mkdir -p /home/gosh/.ssh /run/sshd
+            mkdir -p /home/gosh/.ssh /run/sshd /etc/ssh/sshd_config.d
             printf '%s\n' '$pub' > /home/gosh/.ssh/authorized_keys
             chown -R gosh:gosh /home/gosh/.ssh
             chmod 700 /home/gosh/.ssh
@@ -177,9 +191,13 @@ jobs:
         # runs in the foreground under a detached wsl.exe rather than
         # daemonising and letting WSL tear the instance down underneath it.
         run: |
-          Start-Process -FilePath wsl -ArgumentList '-u','root','/usr/sbin/sshd','-D','-e' -WindowStyle Hidden
-          Start-Sleep -Seconds 5
+          Start-Process -FilePath wsl `
+            -ArgumentList '-u','root','/usr/sbin/sshd','-D','-e' `
+            -RedirectStandardError "$env:RUNNER_TEMP\sshd.log" `
+            -WindowStyle Hidden
 
+      # The Makefile recipe verbatim: GNU make is not part of the Windows
+      # runner image, so this job cannot call `make integration-test`.
       - name: Run integration tests
         shell: bash
         env:
@@ -190,8 +208,9 @@ jobs:
           export GOSH_IT_KEY="$RUNNER_TEMP/client_key"
           go test -race -tags integration -timeout 15m ./test/integration/
 
-      - name: WSL sshd status
+      - name: sshd log and listeners
         if: failure()
-        shell: pwsh
+        shell: bash
         run: |
-          wsl -u root bash -c "ss -lntup | head -40; journalctl -n50 --no-pager 2>/dev/null || true"
+          cat "$RUNNER_TEMP/sshd.log" || true
+          wsl -u root bash -c "cat /var/log/auth.log 2>/dev/null | tail -40 || true; (ss -lntup || netstat -lnp) 2>/dev/null | head -40 || true"

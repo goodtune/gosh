@@ -52,6 +52,11 @@ internal/
   client/            Session loop: input pump, escape handling (Ctrl-^ .),
                      datagram pump, resize watcher (SIGWINCH / Windows poll)
   termenv/           Raw mode + Windows VT-processing enablement
+assets/              Brand artwork, transparent RGBA PNGs: gosh-wordmark (logo
+                     with text), gosh-primary (mark alone), gosh-icon-{512,128,64},
+                     gosh-favicon-{32,16}. README embeds them by absolute
+                     raw.githubusercontent URL so release archives, which ship
+                     only README.md and LICENSE, still render them.
 test/integration/    testcontainers: Debian sshd+mosh-server image, library
                      E2E + CLI-binary E2E (behind the `integration` build tag)
 ```

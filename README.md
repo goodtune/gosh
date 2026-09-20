@@ -19,7 +19,7 @@ gosh speaks the mosh protocol — SSH bootstrap, then AES-128-OCB3-sealed UDP da
 | **macOS** | amd64, arm64 | ✅ `macos-latest` | ✅ Homebrew `mosh-server` behind a throwaway sshd |
 | **Linux** | amd64, arm64 | ✅ `ubuntu-latest` | ✅ Debian sshd + `mosh-server` container (testcontainers) |
 
-Windows is the primary target: no ssh binary, no Cygwin, no WSL needed to *run* gosh — WSL appears above only because CI has to put a POSIX `mosh-server` somewhere for the Windows client to talk to. Every job runs on its runner's own architecture (arm64 on macOS, amd64 elsewhere); the other architectures are cross-compiled and not executed.
+Windows is the primary target: no ssh binary, no Cygwin, no WSL needed to *run* gosh — WSL appears above only because CI has to put a POSIX `mosh-server` somewhere for the Windows client to talk to, and it is the one Linux userspace a Windows runner offers. Every job runs on its runner's own architecture (arm64 on macOS, amd64 elsewhere); the other architectures are cross-compiled and not executed.
 
 Every build is `CGO_ENABLED=0`, so the same source cross-compiles to any other platform Go supports with nothing but `GOOS`/`GOARCH`.
 

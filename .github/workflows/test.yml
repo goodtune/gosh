@@ -148,9 +148,12 @@ jobs:
     # WSL 2 rather than WSL 1, even though WSL 1 would share the host network
     # stack: openssh-server cannot install under WSL 1, whose flock() fails on
     # /etc/passwd ("Failed to take /etc/passwd lock: Invalid argument") and
-    # takes the postinst down with it. WSL 2 puts the distro behind a NAT
-    # whose localhost forwarding covers TCP only, so the tests address the VM
-    # directly, which the mosh UDP session needs anyway.
+    # takes the postinst down with it. WSL 2 is a NAT'd VM instead, and its
+    # localhost relay covers TCP only -- no use to a UDP session -- while the
+    # Hyper-V firewall drops host-to-VM traffic by default. Mirrored
+    # networking removes both problems by giving the distro the host's own
+    # interfaces; the job still probes which address answers rather than
+    # assuming the mode took effect.
     name: Integration (Windows, WSL rig)
     runs-on: windows-latest
     steps:
@@ -165,11 +168,22 @@ jobs:
       # executes gosh.
       - uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
         with:
-          # The action's default distribution, and the one with the most WSL 1
-          # mileage behind it.
+          # The action's default distribution; mosh and openssh-server are
+          # both stock packages there.
           distribution: Debian-13
           wsl-version: 2
           additional-packages: mosh openssh-server
+
+      - name: Put the distro on the host network
+        shell: pwsh
+        run: |
+          @(
+            '[wsl2]'
+            'networkingMode=mirrored'
+            'firewall=false'
+          ) | Set-Content -Path "$env:USERPROFILE\.wslconfig" -Encoding ascii
+          Get-Content "$env:USERPROFILE\.wslconfig"
+          wsl --shutdown
 
       - name: Configure sshd inside WSL
         shell: bash
@@ -201,26 +215,37 @@ jobs:
             -RedirectStandardError "$env:RUNNER_TEMP\sshd.log" `
             -WindowStyle Hidden
 
-      - name: Find the WSL address
-        shell: bash
-        # WSL 2 is a VM on a NAT: the distro has its own address, and unlike
-        # TCP there is no localhost relay for the UDP the mosh session runs
-        # over, so every connection in this job goes to that address. Read it
-        # only once sshd is up: an idle distro shuts down and comes back on a
-        # different address.
+      - name: Find the address that answers
+        shell: pwsh
+        # Mirrored networking should make 127.0.0.1 work; NAT mode needs the
+        # distro's own address, and the Hyper-V firewall may allow neither.
+        # Probe instead of assuming, and fail loudly with what was tried.
         run: |
-          set -euo pipefail
-          ip=$(wsl hostname -I | tr -d '\r' | awk '{print $1}')
-          test -n "$ip"
-          echo "WSL_IP=$ip" >> "$GITHUB_ENV"
-          echo "WSL distro is at $ip"
+          $candidates = @('127.0.0.1')
+          $vmIP = (wsl hostname -I) -replace "`r", ''
+          if ($vmIP) { $candidates += $vmIP.Trim().Split(' ')[0] }
+          Write-Host "Trying: $($candidates -join ', ')"
+          $found = $null
+          foreach ($attempt in 1..30) {
+            foreach ($candidate in $candidates) {
+              $client = New-Object Net.Sockets.TcpClient
+              try {
+                if ($client.ConnectAsync($candidate, 2222).Wait(1000)) { $found = $candidate }
+              } catch { } finally { $client.Dispose() }
+              if ($found) { break }
+            }
+            if ($found) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $found) { throw "no candidate address accepted a connection on 2222: $($candidates -join ', ')" }
+          Write-Host "sshd answers on $found"
+          "GOSH_IT_HOST=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # The Makefile recipe verbatim: GNU make is not part of the Windows
       # runner image, so this job cannot call `make integration-test`.
       - name: Run integration tests
         shell: bash
         env:
-          GOSH_IT_HOST: ${{ env.WSL_IP }}
           GOSH_IT_SSH_PORT: "2222"
           GOSH_IT_USER: gosh
         run: |

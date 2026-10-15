@@ -164,7 +164,7 @@ jobs:
       # Pinned to the v7.0.0 commit: this is the only third-party action in
       # the repo, and it runs arbitrary code on a runner that then builds and
       # executes gosh.
-      - uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
+      - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
         with:
           # The action requires a pinned version; plain "Alpine" is rejected.
           distribution: Alpine-3.23
